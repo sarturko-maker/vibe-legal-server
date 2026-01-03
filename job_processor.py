@@ -47,102 +47,125 @@ BASE_PROMPT = """You are a legal document reviewer. Analyze this contract agains
 Return ONLY a JSON array of operations. No markdown, no explanation."""
 
 STRUCTURE_AWARE_RULES = """
-## STRUCTURE-AWARE OPERATION RULES
+## OPERATION SELECTION RULES - CRITICAL!
 
-### CRITICAL: Never Reference Text You Are Changing
-If you AMEND text in clause 1, do NOT use that same text as an anchor for INSERT.
-Use the clause NUMBER instead.
+### Rule 1: PREFER AMEND OVER INSERT
+When adding content to an existing clause, use AMEND to append - don't INSERT a new paragraph.
+
+WRONG - Adding exclusions as separate clause:
+  INSERT "EXCLUSIONS: Confidential Information shall not include..."
+  Creates floating paragraph outside definition list
+
+CORRECT - AMEND the definition to include exclusions:
+  AMEND old: "marked as confidential."
+  AMEND new: "marked as confidential. Exclusions: CI shall not include (a) public info..."
+  Keeps exclusions as part of the definition
+
+### Rule 2: MINIMAL REDLINING
+Only redline what actually changes. Don't delete and re-insert unchanged text.
+
+WRONG - Over-redlines:
+  old: "the Receiving Party shall be liable for any breach by its Representatives."
+  new: "the Receiving Party shall be liable for any breach by its Representatives. May also disclose..."
+  Strikes through and re-underlines unchanged text unnecessarily
+
+CORRECT - Minimal:
+  old: "by its Representatives."
+  new: "by its Representatives. The Receiving Party may also disclose..."
+  Only adds the new sentence
+
+### Rule 3: REMOVING CLAUSES - Use [RESERVED]
+When removing a clause, change heading to [RESERVED] and DELETE body only.
+
+WRONG:
+  DELETE heading "NON-SOLICITATION"
+  DELETE body
+  INSERT "[Intentionally deleted.]"
+  Removes clause number, creates floating text
+
+CORRECT:
+  AMEND heading: "NON-SOLICITATION" to "[RESERVED]"
+  DELETE body paragraph only
+  Clause number remains, strikethrough IS the redline
+
+### Rule 4: AMEND EXISTING CLAUSES, DON'T INSERT REPLACEMENTS
+When playbook says to change text (like "AMEND if unlimited"), find and amend existing text.
+
+WRONG - Inserting new liability clause:
+  INSERT "Limitation of Liability. Total liability shall not exceed 50000..."
+  Creates new floating clause when one already exists
+
+CORRECT - AMEND existing clause:
+  AMEND old: "liability under this Agreement shall be unlimited"
+  new: "total liability under this Agreement shall not exceed 50000"
+  Modifies existing clause in place
+
+### Decision Tree
+1. Does similar text already exist? AMEND it, don't INSERT new
+2. Adding to end of existing clause? AMEND with minimal old text (just the ending)
+3. Removing a clause? AMEND heading to [RESERVED], DELETE body
+4. Adding truly NEW clause that has no similar existing text? INSERT
+
+---
+
+## TARGETING RULES
 
 ### How to Reference Targets
-Use ONE of these methods (in order of preference):
+1. target_clause_number - for numbered clauses: "1", "2", "1.1"
+2. target_section - for section headings: "BETWEEN", "OBLIGATIONS"
+3. target_node_id - for specific paragraphs: "p3"
 
-1. **target_clause_number** - for numbered clauses:
-   "target_clause_number": "1"     → finds "1. Definitions"
-   "target_clause_number": "2"     → finds "2. Obligations"
-   "target_clause_number": "1.1"   → finds "1.1 Sub-clause"
+### Position Values (for INSERT only)
+- "AFTER_SECTION" - after ALL children/body (USE THIS for new clauses!)
+- "AFTER" - immediately after target paragraph only
+- "LAST_CHILD" - as last item inside a section
 
-2. **target_section** - for section headings:
-   "target_section": "BETWEEN"     → finds "BETWEEN:" section
-   "target_section": "OBLIGATIONS" → finds "OBLIGATIONS:" section
+### Don't Include Numbers in new_content
+System auto-numbers. Do NOT include clause numbers:
+WRONG: "5. Return of Information..."
+RIGHT: "Return of Information..."
 
-3. **target_node_id** - for specific paragraphs (from structure map):
-   "target_node_id": "p3"          → finds paragraph 3
+---
 
-### Position Values - CRITICAL GUIDANCE!
-- **"AFTER"** - immediately after the target paragraph HEADING only
-  ⚠️ Use only when you want to insert between a heading and its body!
-  
-- **"AFTER_SECTION"** - after ALL children/body of a section  
-  ✓ USE THIS when adding new clauses after a numbered clause!
-  Example: To add clause 5 after clause 4's body, use:
-    "target_clause_number": "4", "position": "AFTER_SECTION"
-  
-- **"LAST_CHILD"** - as last item inside a section (use for adding bullets)
-- **"BEFORE"** - immediately before target
+## OPERATION FORMATS
 
-### IMPORTANT: Don't Include Numbers in new_content
-The system will auto-number. Do NOT include clause numbers in the text:
-❌ WRONG: "new_content": "5. Return of Information. Upon termination..."
-✓ RIGHT: "new_content": "Return of Information. Upon termination..."
-
-### IMPORTANT: Understand List vs Clause Insertions
-- If inserting after a DEFINITION or LIST_ITEM (a), (b), (c), your insert will become the next list item
-- If you want a NEW SECTION or CLAUSE, use:
-  - "position": "AFTER_SECTION" to exit the list first
-  - "new_role": "CLAUSE" or "SECTION_HEAD" to specify the type
-
-### Operation Formats
-
-**AMEND** (change text within a paragraph):
+**AMEND** (change text - PREFERRED!):
 {
   "type": "AMEND",
   "target_clause_number": "1",
-  "old_text": "exact text to find",
-  "new_text": "replacement text",
-  "reason": "Why this change"
+  "old_text": "just the ending text.",
+  "new_text": "just the ending text. Plus new appended content here.",
+  "reason": "Adding exclusions to definition"
 }
 
-**INSERT** (add single paragraph - USE AFTER_SECTION for new clauses!):
+**AMEND for heading change** (clause removal):
+{
+  "type": "AMEND",
+  "target_clause_number": "6",
+  "old_text": "NON-SOLICITATION",
+  "new_text": "[RESERVED]",
+  "reason": "Removing non-solicitation clause"
+}
+
+**DELETE** (remove body paragraph):
+{
+  "type": "DELETE",
+  "target_clause_number": "6",
+  "reason": "Removing body of reserved clause"
+}
+
+**INSERT** (ONLY for truly new content with no existing text to amend):
 {
   "type": "INSERT",
   "target_clause_number": "4",
   "position": "AFTER_SECTION",
   "new_role": "CLAUSE",
-  "new_content": "Return of Information. Upon termination of this Agreement...",
-  "reason": "Adding return clause"
-}
-
-**INSERT_WITH_CHILDREN** (add section with items - PREFERRED for multi-item):
-{
-  "type": "INSERT_WITH_CHILDREN",
-  "target_section": "BETWEEN",
-  "position": "AFTER_SECTION",
-  "content_tree": {
-    "role": "SECTION_HEAD",
-    "text": "DEFINITIONS:",
-    "children": [
-      {"role": "LIST_ITEM", "text": "\\"Confidential Information\\" means...", "children": []},
-      {"role": "LIST_ITEM", "text": "\\"Disclosing Party\\" means...", "children": []}
-    ]
-  },
-  "reason": "Adding definitions section"
-}
-
-**DELETE** (remove paragraph):
-{
-  "type": "DELETE",
-  "target_clause_number": "5",
-  "reason": "Removing problematic clause"
+  "new_content": "Return of Information. Upon termination...",
+  "reason": "Adding new clause not covered by existing text"
 }
 
 ### Role Values
-- SECTION_HEAD: Unnumbered heading (BETWEEN:, OBLIGATIONS:)
-- ARTICLE: Top-level numbered (1., 2., ARTICLE 1)
-- CLAUSE: Sub-numbered (1.1, 1.2)
-- SUB_CLAUSE: Third level (1.1.1, (a), (b))
-- LIST_ITEM: Bullet point or lettered item
-- BODY: Plain paragraph text
-- DEFINITION: Definition entry ("Term" means...)
+SECTION_HEAD, ARTICLE, CLAUSE, SUB_CLAUSE, LIST_ITEM, BODY, DEFINITION
 """
 
 
