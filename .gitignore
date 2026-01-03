@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.env
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Uploads and processed files
+Uploads/
+ProcessedDocs/
+
+# Logs
+logs/
+*.log
+
+# Node (frontend)
+vibelegal-frontend/node_modules/
+vibelegal-frontend/.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gemini artifacts
+.gemini/
