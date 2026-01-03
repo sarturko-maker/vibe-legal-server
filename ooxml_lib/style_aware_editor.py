@@ -1,6 +1,12 @@
 """
 Style-aware editor for legal documents.
 Detects and matches formatting styles for inserts.
+
+v0.7 FIXES:
+- Never copy numPr or pStyle (avoids duplicate numbering)
+- Strip leading numbers from AI content (AI shouldn't provide numbers)
+- Proper insert ordering with element tracking
+- Better text normalization for quote/apostrophe matching
 """
 
 from io import BytesIO
@@ -11,6 +17,37 @@ import re
 from datetime import datetime
 
 W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+
+
+def strip_leading_number(text: str) -> str:
+    """
+    Remove leading clause numbers from text.
+    AI shouldn't include numbers - they're added by the system or Word.
+    
+    Examples:
+        "5. Return of Information" -> "Return of Information"
+        "2A. Exclusions" -> "Exclusions"
+        "1.1 Sub-clause" -> "Sub-clause"
+        "Return of Information" -> "Return of Information" (unchanged)
+    """
+    if not text:
+        return text
+    
+    # Pattern: optional number(s) with dots, optional letter, then dot/space
+    patterns = [
+        r'^\d+[A-Za-z]?\.\s+',      # "5. ", "2A. ", "1. "
+        r'^\d+\.\d+\.?\s+',          # "1.1 ", "1.1. "
+        r'^\d+\.\d+\.\d+\.?\s+',     # "1.1.1 ", "1.1.1. "
+        r'^\([a-z]\)\s+',            # "(a) ", "(b) "
+        r'^\([ivxlc]+\)\s+',         # "(i) ", "(ii) "
+    ]
+    
+    for pattern in patterns:
+        match = re.match(pattern, text, re.IGNORECASE)
+        if match:
+            return text[match.end():]
+    
+    return text
 
 
 class StyleAwareEditor:
@@ -26,8 +63,8 @@ class StyleAwareEditor:
         self.body = self.root.find(f'{W}body')
         self.next_id = self._find_max_id() + 1
         
-        # Track last inserted paragraph for each anchor index
-        # Ensures proper ordering when multiple inserts target same anchor
+        # Track last inserted paragraph ELEMENT for each anchor index
+        # This ensures proper ordering when multiple inserts target same anchor
         self._last_insert_at: dict = {}
     
     @classmethod
@@ -74,23 +111,18 @@ class StyleAwareEditor:
     def _normalize_text(self, text: str) -> str:
         """
         Normalize text for comparison.
-        Handles:
-        - Curly quotes → straight quotes
-        - Curly apostrophes → straight apostrophe  
-        - Em/en dashes → regular hyphen
-        - Multiple spaces → single space
-        - Leading/trailing whitespace
+        Handles curly quotes, apostrophes, dashes, whitespace.
         """
         if not text:
             return ""
         
         # Normalize quotes
-        text = text.replace('"', '"').replace('"', '"')  # Curly double quotes
-        text = text.replace("'", "'").replace("'", "'")  # Curly single quotes/apostrophes
-        text = text.replace("'", "'")                     # Another apostrophe variant
+        text = text.replace('"', '"').replace('"', '"')
+        text = text.replace("'", "'").replace("'", "'")
+        text = text.replace("'", "'")
         
         # Normalize dashes
-        text = text.replace("–", "-").replace("—", "-")  # En-dash, em-dash
+        text = text.replace("–", "-").replace("—", "-")
         
         # Normalize whitespace
         text = re.sub(r'\s+', ' ', text)
@@ -107,7 +139,50 @@ class StyleAwareEditor:
                 return idx, p
         return None
     
+    def _copy_safe_properties(self, src_para) -> etree._Element:
+        """
+        Copy ONLY safe paragraph properties (ind, spacing).
+        
+        CRITICAL FIX: NEVER copy:
+        - numPr (causes Word auto-numbering = duplicate numbers)
+        - pStyle (may reference a numbered style)
+        """
+        new_pPr = etree.Element(f'{W}pPr')
+        
+        src_pPr = src_para.find(f'{W}pPr')
+        if src_pPr is not None:
+            # ONLY copy indentation and spacing - nothing else
+            for prop in ['ind', 'spacing']:
+                elem = src_pPr.find(f'{W}{prop}')
+                if elem is not None:
+                    new_pPr.append(deepcopy(elem))
+        
+        return new_pPr if len(new_pPr) > 0 else None
+    
+    def _get_insert_target(self, after_index: int):
+        """
+        Get the paragraph to insert after, respecting previous inserts.
+        
+        CRITICAL FIX: Returns the actual ELEMENT to use with addnext(),
+        ensuring proper ordering when multiple inserts target same anchor.
+        """
+        paragraphs = self._get_paragraphs()
+        if after_index < 0 or after_index >= len(paragraphs):
+            return None, None
+        
+        original_para = paragraphs[after_index]
+        
+        # Check if we've already inserted after this anchor
+        if after_index in self._last_insert_at:
+            target = self._last_insert_at[after_index]
+            # Verify the element is still in the tree
+            if target.getparent() is not None:
+                return target, original_para
+        
+        return original_para, original_para
+    
     def detect_inline_title_style(self, para_index: int) -> str:
+        """Detect if nearby paragraphs use bold, underline, or plain titles."""
         paragraphs = self._get_paragraphs()
         if para_index >= len(paragraphs):
             return 'plain'
@@ -142,6 +217,7 @@ class StyleAwareEditor:
         return 'none'
     
     def detect_numbering_style(self, para_index: int) -> tuple:
+        """Detect numbering style of paragraph."""
         paragraphs = self._get_paragraphs()
         if para_index >= len(paragraphs):
             return 'none', None
@@ -164,30 +240,20 @@ class StyleAwareEditor:
         return 'none', None
     
     def insert_plain_paragraph(self, after_index: int, text: str) -> bool:
-        paragraphs = self._get_paragraphs()
-        if after_index < 0 or after_index >= len(paragraphs):
+        """Insert a plain paragraph with track changes."""
+        target, original_para = self._get_insert_target(after_index)
+        if target is None:
             return False
         
-        # Use last inserted paragraph if available, otherwise use the anchor
-        if after_index in self._last_insert_at:
-            target = self._last_insert_at[after_index]
-        else:
-            target = paragraphs[after_index]
+        # CRITICAL FIX: Strip any leading numbers from AI content
+        text = strip_leading_number(text)
         
         new_para = etree.Element(f'{W}p')
         
-        # Copy properties from ORIGINAL paragraph (not the tracked one)
-        original_para = paragraphs[after_index]
-        src_pPr = original_para.find(f'{W}pPr')
-        if src_pPr is not None:
-            new_pPr = etree.Element(f'{W}pPr')
-            # NOTE: Don't copy 'numPr' - it causes duplicate numbering
-            for prop in ['ind', 'spacing']:
-                elem = src_pPr.find(f'{W}{prop}')
-                if elem is not None:
-                    new_pPr.append(deepcopy(elem))
-            if len(new_pPr) > 0:
-                new_para.append(new_pPr)
+        # Copy ONLY safe properties (no numPr, no pStyle)
+        safe_pPr = self._copy_safe_properties(original_para)
+        if safe_pPr is not None:
+            new_para.append(safe_pPr)
         
         ins = etree.SubElement(new_para, f'{W}ins', self._create_tc_attrs())
         run = etree.SubElement(ins, f'{W}r')
@@ -201,33 +267,24 @@ class StyleAwareEditor:
         return True
     
     def insert_with_bold_title(self, after_index: int, title: str, body: str) -> bool:
-        paragraphs = self._get_paragraphs()
-        if after_index < 0 or after_index >= len(paragraphs):
+        """Insert paragraph with bold title and normal body."""
+        target, original_para = self._get_insert_target(after_index)
+        if target is None:
             return False
         
-        # Use last inserted paragraph if available, otherwise use the anchor
-        if after_index in self._last_insert_at:
-            target = self._last_insert_at[after_index]
-        else:
-            target = paragraphs[after_index]
+        # CRITICAL FIX: Strip any leading numbers from AI content
+        title = strip_leading_number(title)
         
         new_para = etree.Element(f'{W}p')
         
-        # Copy properties from ORIGINAL paragraph
-        original_para = paragraphs[after_index]
-        src_pPr = original_para.find(f'{W}pPr')
-        if src_pPr is not None:
-            new_pPr = etree.Element(f'{W}pPr')
-            # NOTE: Don't copy 'numPr' - it causes duplicate numbering
-            for prop in ['ind', 'spacing']:
-                elem = src_pPr.find(f'{W}{prop}')
-                if elem is not None:
-                    new_pPr.append(deepcopy(elem))
-            if len(new_pPr) > 0:
-                new_para.append(new_pPr)
+        # Copy ONLY safe properties
+        safe_pPr = self._copy_safe_properties(original_para)
+        if safe_pPr is not None:
+            new_para.append(safe_pPr)
         
         ins = etree.SubElement(new_para, f'{W}ins', self._create_tc_attrs())
         
+        # Bold title run
         title_run = etree.SubElement(ins, f'{W}r')
         title_rPr = etree.SubElement(title_run, f'{W}rPr')
         etree.SubElement(title_rPr, f'{W}b')
@@ -235,39 +292,213 @@ class StyleAwareEditor:
         title_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
         title_t.text = title + ". "
         
+        # Normal body run
         body_run = etree.SubElement(ins, f'{W}r')
         body_t = etree.SubElement(body_run, f'{W}t')
         body_t.text = body
         
         target.addnext(new_para)
         
-        # Track this insert for subsequent inserts at same anchor
         self._last_insert_at[after_index] = new_para
         return True
     
-    def insert_with_underline_title(self, after_index: int, title: str, body: str) -> bool:
-        paragraphs = self._get_paragraphs()
-        if after_index < 0 or after_index >= len(paragraphs):
+    def insert_numbered_clause(self, after_index: int, title: str, body: str) -> bool:
+        """
+        Insert a new numbered clause that joins the document's numbered list.
+        
+        Use this for TOP-LEVEL clause inserts (e.g., new "4. Return of Information").
+        DO NOT use for sub-items or content inside definition lists.
+        
+        This method DOES copy numPr from nearby paragraphs to continue the numbering.
+        """
+        target, original_para = self._get_insert_target(after_index)
+        if target is None:
             return False
         
-        # Use last inserted paragraph if available
-        if after_index in self._last_insert_at:
-            target = self._last_insert_at[after_index]
-        else:
-            target = paragraphs[after_index]
+        # Strip leading numbers from title
+        title = strip_leading_number(title)
         
         new_para = etree.Element(f'{W}p')
         
-        original_para = paragraphs[after_index]
+        # Find numPr from a nearby numbered paragraph
+        numPr_source = self._find_nearby_numPr(after_index)
+        
+        # Create pPr with numbering
+        new_pPr = etree.SubElement(new_para, f'{W}pPr')
+        
+        if numPr_source is not None:
+            # Copy the numbering properties to join the list
+            new_pPr.append(deepcopy(numPr_source))
+        
+        # Also copy indentation and spacing from original
         src_pPr = original_para.find(f'{W}pPr')
         if src_pPr is not None:
-            new_pPr = etree.Element(f'{W}pPr')
-            for prop in ['ind', 'spacing']:
-                elem = src_pPr.find(f'{W}{prop}')
-                if elem is not None:
-                    new_pPr.append(deepcopy(elem))
-            if len(new_pPr) > 0:
-                new_para.append(new_pPr)
+            ind = src_pPr.find(f'{W}ind')
+            if ind is not None:
+                new_pPr.append(deepcopy(ind))
+            spacing = src_pPr.find(f'{W}spacing')
+            if spacing is not None:
+                new_pPr.append(deepcopy(spacing))
+        
+        ins = etree.SubElement(new_para, f'{W}ins', self._create_tc_attrs())
+        
+        # Bold title run
+        title_run = etree.SubElement(ins, f'{W}r')
+        title_rPr = etree.SubElement(title_run, f'{W}rPr')
+        etree.SubElement(title_rPr, f'{W}b')
+        title_t = etree.SubElement(title_run, f'{W}t')
+        title_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        title_t.text = title + ". "
+        
+        # Normal body run
+        body_run = etree.SubElement(ins, f'{W}r')
+        body_t = etree.SubElement(body_run, f'{W}t')
+        body_t.text = body
+        
+        target.addnext(new_para)
+        
+        self._last_insert_at[after_index] = new_para
+        return True
+    
+    def _find_nearby_numPr(self, index: int):
+        """Find numPr from a nearby paragraph to use for numbering."""
+        paragraphs = self.body.findall(f'{W}p')
+        
+        # Look at the anchor paragraph and a few before/after
+        search_range = range(max(0, index - 3), min(len(paragraphs), index + 3))
+        
+        for i in search_range:
+            para = paragraphs[i]
+            pPr = para.find(f'{W}pPr')
+            if pPr is not None:
+                numPr = pPr.find(f'{W}numPr')
+                if numPr is not None:
+                    return numPr
+        
+        return None
+    
+    def insert_styled_clause(self, after_index: int, title: str, body: str, 
+                             heading_style: str = "Heading2") -> bool:
+        """
+        Insert a new clause with heading style (for documents without Word auto-numbering).
+        
+        Use this for documents like NDA-Headers-Indented where:
+        - Clause headings use a style (e.g., Heading2) with manual numbers
+        - Clause body is a separate paragraph below
+        
+        This method:
+        1. Calculates the next clause number from nearby headings
+        2. Inserts a heading paragraph with the style
+        3. Inserts a body paragraph below
+        """
+        target, original_para = self._get_insert_target(after_index)
+        if target is None:
+            return False
+        
+        # Strip leading numbers from title
+        title = strip_leading_number(title)
+        
+        # Find the next number by looking at nearby headings
+        next_num = self._calculate_next_clause_number(after_index, heading_style)
+        
+        # Create HEADING paragraph with style
+        heading_para = etree.Element(f'{W}p')
+        heading_pPr = etree.SubElement(heading_para, f'{W}pPr')
+        pStyle = etree.SubElement(heading_pPr, f'{W}pStyle')
+        pStyle.set(f'{W}val', heading_style)
+        
+        # Copy spacing from original if available
+        src_pPr = original_para.find(f'{W}pPr')
+        if src_pPr is not None:
+            spacing = src_pPr.find(f'{W}spacing')
+            if spacing is not None:
+                heading_pPr.append(deepcopy(spacing))
+        
+        ins_heading = etree.SubElement(heading_para, f'{W}ins', self._create_tc_attrs())
+        heading_run = etree.SubElement(ins_heading, f'{W}r')
+        heading_t = etree.SubElement(heading_run, f'{W}t')
+        heading_t.text = f"{next_num}. {title}"
+        
+        # Create BODY paragraph
+        body_para = etree.Element(f'{W}p')
+        body_pPr = etree.SubElement(body_para, f'{W}pPr')
+        
+        # Copy indentation and spacing from original body paragraphs
+        if src_pPr is not None:
+            ind = src_pPr.find(f'{W}ind')
+            if ind is not None:
+                body_pPr.append(deepcopy(ind))
+            spacing = src_pPr.find(f'{W}spacing')
+            if spacing is not None:
+                body_pPr.append(deepcopy(spacing))
+        
+        ins_body = etree.SubElement(body_para, f'{W}ins', self._create_tc_attrs())
+        body_run = etree.SubElement(ins_body, f'{W}r')
+        body_t = etree.SubElement(body_run, f'{W}t')
+        body_t.text = body
+        
+        # Insert both: heading first, then body
+        target.addnext(heading_para)
+        heading_para.addnext(body_para)
+        
+        # Track the last inserted element (body paragraph)
+        self._last_insert_at[after_index] = body_para
+        return True
+    
+    def _calculate_next_clause_number(self, after_index: int, heading_style: str) -> int:
+        """Calculate the next clause number based on the heading BEFORE our insert point."""
+        paragraphs = self.body.findall(f'{W}p')
+        
+        # Find the last heading number at or before after_index
+        last_num_before = 0
+        
+        for i in range(min(after_index + 1, len(paragraphs))):
+            para = paragraphs[i]
+            pPr = para.find(f'{W}pPr')
+            if pPr is not None:
+                pStyle = pPr.find(f'{W}pStyle')
+                if pStyle is not None and pStyle.get(f'{W}val') == heading_style:
+                    text = ''.join(t.text or '' for t in para.findall(f'.//{W}t'))
+                    match = re.match(r'^(\d+)\.', text)
+                    if match:
+                        last_num_before = int(match.group(1))
+        
+        # Also check if we've inserted any headings after after_index already
+        # (for sequential inserts at same anchor)
+        if after_index in self._last_insert_at:
+            last_inserted = self._last_insert_at[after_index]
+            # Walk backwards to find the heading of our last insert
+            prev = last_inserted.getprevious()
+            while prev is not None:
+                pPr = prev.find(f'{W}pPr')
+                if pPr is not None:
+                    pStyle = pPr.find(f'{W}pStyle')
+                    if pStyle is not None and pStyle.get(f'{W}val') == heading_style:
+                        text = ''.join(t.text or '' for t in prev.findall(f'.//{W}t'))
+                        match = re.match(r'^(\d+)\.', text)
+                        if match:
+                            inserted_num = int(match.group(1))
+                            if inserted_num > last_num_before:
+                                last_num_before = inserted_num
+                        break
+                prev = prev.getprevious()
+        
+        return last_num_before + 1
+    
+    def insert_with_underline_title(self, after_index: int, title: str, body: str) -> bool:
+        """Insert paragraph with underlined title and normal body."""
+        target, original_para = self._get_insert_target(after_index)
+        if target is None:
+            return False
+        
+        # Strip leading numbers
+        title = strip_leading_number(title)
+        
+        new_para = etree.Element(f'{W}p')
+        
+        safe_pPr = self._copy_safe_properties(original_para)
+        if safe_pPr is not None:
+            new_para.append(safe_pPr)
         
         ins = etree.SubElement(new_para, f'{W}ins', self._create_tc_attrs())
         
@@ -287,94 +518,41 @@ class StyleAwareEditor:
         self._last_insert_at[after_index] = new_para
         return True
     
-    def insert_sub_clause(self, after_index: int, parent_num: str, sub_num: int, 
-                          title: str, body: str) -> bool:
-        paragraphs = self._get_paragraphs()
-        if after_index < 0 or after_index >= len(paragraphs):
-            return False
-        
-        # Use last inserted paragraph if available
-        if after_index in self._last_insert_at:
-            target = self._last_insert_at[after_index]
-        else:
-            target = paragraphs[after_index]
-        
-        new_para = etree.Element(f'{W}p')
-        
-        original_para = paragraphs[after_index]
-        src_pPr = original_para.find(f'{W}pPr')
-        if src_pPr is not None:
-            new_pPr = etree.Element(f'{W}pPr')
-            for prop in ['ind', 'spacing']:
-                elem = src_pPr.find(f'{W}{prop}')
-                if elem is not None:
-                    new_pPr.append(deepcopy(elem))
-            if len(new_pPr) > 0:
-                new_para.append(new_pPr)
-        
-        ins = etree.SubElement(new_para, f'{W}ins', self._create_tc_attrs())
-        
-        num_run = etree.SubElement(ins, f'{W}r')
-        num_rPr = etree.SubElement(num_run, f'{W}rPr')
-        u_elem = etree.SubElement(num_rPr, f'{W}u')
-        u_elem.set(f'{W}val', 'single')
-        num_t = etree.SubElement(num_run, f'{W}t')
-        num_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-        num_t.text = f"{parent_num}.{sub_num} {title}. "
-        
-        body_run = etree.SubElement(ins, f'{W}r')
-        body_t = etree.SubElement(body_run, f'{W}t')
-        body_t.text = body
-        
-        target.addnext(new_para)
-        self._last_insert_at[after_index] = new_para
-        return True
-    
     def smart_insert(self, after_index: int, title: str, body: str, 
                      context_info: dict = None) -> bool:
+        """
+        Smart insert that matches document style.
+        
+        CRITICAL FIX: Don't auto-use sub-clause numbering.
+        The AI should specify new_role: SUB_CLAUSE explicitly if it wants sub-clauses.
+        """
         context_info = context_info or {}
+        
+        # Strip leading numbers from title (AI shouldn't provide them)
+        title = strip_leading_number(title)
         
         title_style = self.detect_inline_title_style(after_index)
         num_style, num_val = self.detect_numbering_style(after_index)
         
+        # For Word auto-numbered lists - DON'T inherit numbering
         if num_style == 'word_list':
             if title_style == 'bold':
                 return self.insert_with_bold_title(after_index, title, body)
             else:
                 return self.insert_plain_paragraph(after_index, f"{title}. {body}")
         
-        elif num_style == 'sub':
-            parent = num_val.split('.')[0]
-            existing_sub = int(num_val.split('.')[1])
-            next_sub = existing_sub + 1
-            return self.insert_sub_clause(after_index, parent, next_sub, title, body)
-        
-        elif num_style == 'manual':
-            if context_info.get('use_sub_clauses'):
-                parent_num = num_val.rstrip('.')
-                sub_num = context_info.get('sub_number', 1)
-                return self.insert_sub_clause(after_index, parent_num, sub_num, title, body)
-            elif title_style == 'underline':
-                return self.insert_with_underline_title(after_index, title, body)
-            elif title_style == 'bold':
-                return self.insert_with_bold_title(after_index, title, body)
-            else:
-                return self.insert_plain_paragraph(after_index, f"{title}. {body}")
-        
+        # For manual numbered documents - just match the title style
+        # DON'T auto-create sub-clauses
+        if title_style == 'underline':
+            return self.insert_with_underline_title(after_index, title, body)
+        elif title_style == 'bold':
+            return self.insert_with_bold_title(after_index, title, body)
         else:
-            if title_style == 'bold':
-                return self.insert_with_bold_title(after_index, title, body)
-            elif title_style == 'underline':
-                return self.insert_with_underline_title(after_index, title, body)
-            elif title_style == 'none':
-                return self.insert_plain_paragraph(after_index, f"{title}. {body}")
-            else:
-                return self.insert_plain_paragraph(after_index, f"{title}. {body}")
+            return self.insert_plain_paragraph(after_index, f"{title}. {body}")
     
     def amend_text(self, old_text: str, new_text: str) -> bool:
         """
         Amend text in document with normalized matching.
-        Handles quote/apostrophe variants automatically.
         """
         result = self._find_para_containing(old_text)
         if not result:
@@ -397,8 +575,7 @@ class StyleAwareEditor:
             if norm_start == -1:
                 return False
             
-            # Map normalized position to original position
-            # Walk through original text counting characters
+            # Map normalized position back to original
             norm_idx = 0
             start_pos = None
             
@@ -406,7 +583,6 @@ class StyleAwareEditor:
                 if start_pos is None and norm_idx >= norm_start:
                     start_pos = i
                 
-                # Check if we've found enough normalized characters
                 norm_char = char.lower()
                 if norm_char.isspace():
                     norm_idx += 1
@@ -416,7 +592,6 @@ class StyleAwareEditor:
             if start_pos is None:
                 return False
             
-            # Estimate end position based on original text length
             end_pos = min(start_pos + len(old_text), len(full_text))
         
         actual_old = full_text[start_pos:end_pos]
@@ -526,35 +701,29 @@ class StyleAwareEditor:
         return True
     
     def insert_paragraph_before_index(self, para_index: int, text: str) -> bool:
-        """Insert paragraph BEFORE the given index (0-based)."""
+        """Insert paragraph BEFORE the given index."""
         paragraphs = self._get_paragraphs()
         if para_index < 0 or para_index >= len(paragraphs):
             return False
         
         target = paragraphs[para_index]
+        
+        # Strip leading numbers
+        text = strip_leading_number(text)
+        
         new_para = etree.Element(f'{W}p')
         
-        # Copy paragraph properties from target
-        src_pPr = target.find(f'{W}pPr')
-        if src_pPr is not None:
-            new_pPr = etree.Element(f'{W}pPr')
-            for prop in ['ind', 'spacing']:
-                elem = src_pPr.find(f'{W}{prop}')
-                if elem is not None:
-                    new_pPr.append(deepcopy(elem))
-            if len(new_pPr) > 0:
-                new_para.append(new_pPr)
+        safe_pPr = self._copy_safe_properties(target)
+        if safe_pPr is not None:
+            new_para.append(safe_pPr)
         
-        # Add content as track-changed insert
         ins = etree.SubElement(new_para, f'{W}ins', self._create_tc_attrs())
         run = etree.SubElement(ins, f'{W}r')
         t = etree.SubElement(run, f'{W}t')
         t.text = text
         
-        # Insert before target
         target.addprevious(new_para)
         return True
-
     
     def save(self) -> bytes:
         new_xml = etree.tostring(self.root, xml_declaration=True,
