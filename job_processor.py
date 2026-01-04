@@ -426,6 +426,10 @@ def apply_operations_in_order(
         reverse=True
     )
     
+    # Track clause numbers for auto-increment when multiple INSERTs target same area
+    # Key: para_index, Value: last used clause number
+    insert_clause_counter: dict = {}
+    
     # --- Execute inserts ---
     for resolved, original_op in resolved_inserts:
         if resolved is None:
@@ -493,10 +497,27 @@ def apply_operations_in_order(
                         # Manual numbered docs (1., 2., 3.) - not Word auto-numbered
                         # Detect if original uses bold titles
                         bold_titles = _detect_bold_titles(style_editor, structure)
-                        # Calculate the next clause number
-                        clause_num = _calculate_next_manual_clause_number(
+                        
+                        # Calculate the next clause number with auto-increment
+                        # Use counter to track multiple INSERTs
+                        base_num = _calculate_next_manual_clause_number(
                             resolved.paragraph_index, structure
                         )
+                        
+                        # Check if we've already inserted at this position
+                        # Use para_index as key - multiple inserts at same index increment
+                        counter_key = resolved.paragraph_index
+                        if counter_key in insert_clause_counter:
+                            # Increment from last used number
+                            clause_num = insert_clause_counter[counter_key] + 1
+                        else:
+                            # First insert at this position - use calculated base
+                            clause_num = base_num
+                        
+                        # Update counter for next INSERT
+                        insert_clause_counter[counter_key] = clause_num
+                        logger.info(f"  Manual numbered INSERT: using clause #{clause_num}")
+                        
                         result = style_editor.insert_manual_numbered_clause(
                             resolved.paragraph_index,
                             clause_num,
