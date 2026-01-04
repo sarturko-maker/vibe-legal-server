@@ -626,6 +626,14 @@ PLAYBOOK:
         # Parse response
         operations = parse_ai_response(response_text)
         
+        # Log detailed AI operations for debugging
+        logger.info("=== AI Operations ===")
+        for i, op in enumerate(operations):
+            logger.info(f"  [{i+1}] {op.type} | target_clause={op.target_clause_number} | "
+                       f"target_section={op.target_section} | target_node_id={op.target_node_id} | "
+                       f"position={op.position} | reason={op.reason[:50] if op.reason else ''}...")
+        logger.info("=== End AI Operations ===")
+        
         # Log
         log_ai_response(response_text, [{"type": op.type, "reason": op.reason} for op in operations])
         
