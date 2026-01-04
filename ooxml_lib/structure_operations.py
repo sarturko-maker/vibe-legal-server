@@ -324,6 +324,14 @@ class OperationResolver:
             para_index = target.paragraph_index
             insert_after = True
         
+        # Cap para_index to document bounds
+        if self.structure.nodes:
+            max_index = max(n.paragraph_index for n in self.structure.nodes)
+            if para_index > max_index:
+                logger = logging.getLogger(__name__)
+                logger.warning(f"  para_index {para_index} exceeds max {max_index}, capping to max")
+                para_index = max_index
+        
         # Find a paragraph to copy formatting from
         format_source = self._find_format_source(op.new_role, target)
         

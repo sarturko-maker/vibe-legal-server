@@ -214,6 +214,20 @@ def _calculate_next_manual_clause_number(after_index: int, structure) -> int:
     return last_num_before + 1
 
 
+def strip_leading_number(text: str) -> str:
+    """
+    Remove leading clause numbers like '5. ' or '5.1 ' from text.
+    AI sometimes includes numbers that Word/system should generate.
+    """
+    if not text:
+        return text
+    # Pattern: "5. ", "5.1 ", "5.1.2 ", "(a) ", "(i) "
+    cleaned = re.sub(r'^[\d\.]+\s+', '', text)  # "5. " or "5.1. "
+    cleaned = re.sub(r'^\([a-z]+\)\s+', '', cleaned)  # "(a) "
+    cleaned = re.sub(r'^\([ivxlc]+\)\s+', '', cleaned, flags=re.IGNORECASE)  # "(i) "
+    return cleaned.strip()
+
+
 # =============================================================================
 # PARSING AI OPERATIONS
 # =============================================================================
@@ -442,6 +456,9 @@ def apply_operations_in_order(
             # Parse title and body from content (format: "Title. Body text...")
             title, body = parse_title_body(content)
             
+            # Strip any leading numbers from title (AI sometimes includes "5. Title")
+            title = strip_leading_number(title) if title else title
+            
             # Build context for sub-clauses
             context = {}
             num_style, num_val = style_editor.detect_numbering_style(resolved.paragraph_index)
@@ -635,6 +652,12 @@ PLAYBOOK:
             logger.info(f"  [{i+1}] {op.type} | target_clause={op.target_clause_number} | "
                        f"target_section={op.target_section} | target_node_id={op.target_node_id} | "
                        f"position={op.position} | reason={op.reason[:50] if op.reason else ''}...")
+            # Additional logging for hierarchical inserts
+            if op.type == "INSERT_WITH_CHILDREN":
+                logger.info(f"      content_tree: {op.content_tree is not None}")
+                if op.content_tree:
+                    children_count = len(op.content_tree.get('children', [])) if isinstance(op.content_tree, dict) else 0
+                    logger.info(f"      children count: {children_count}")
         logger.info("=== End AI Operations ===")
         
         # Log
