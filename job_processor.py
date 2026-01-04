@@ -721,6 +721,8 @@ async def process_job(job: Job, jobs_store: Dict[str, Job], playbooks_store: Dic
         logger.info(f"Structure type: {structure.structure_type}")
         logger.info(f"Sections found: {structure.has_sections}")
         logger.info(f"Numbering: manual={structure.has_manual_numbering}, word={structure.has_word_numbering}")
+        logger.info(f"Heading styles: {structure.has_heading_styles} (name={structure.heading_style_name})")
+        logger.info(f"Bullet sections: {structure.has_bullet_sections}")
         logger.info(f"Max depth: {structure.max_depth}")
         logger.info(f"Total nodes: {len(structure.nodes)}")
         

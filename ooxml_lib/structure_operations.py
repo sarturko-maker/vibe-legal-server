@@ -18,6 +18,8 @@ Supports HIERARCHICAL operations for multi-level inserts:
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
+import re
+import logging
 
 try:
     from .structure_detector import StructureMap, StructureNode, NodeRole
@@ -262,9 +264,48 @@ class OperationResolver:
             insert_after = True
         
         elif op.position == InsertPosition.AFTER_SECTION:
-            # Find the last descendant of this section
-            last = self.structure.get_last_descendant(target)
-            para_index = last.paragraph_index
+            # For headed documents (manual numbering without Word auto-numbering),
+            # the clause body is the next paragraph after the heading
+            if self.structure.has_manual_numbering and not self.structure.has_word_numbering:
+                # Check if target is a clause heading (has number like "4.")
+                is_clause_heading = (
+                    target.role == NodeRole.CLAUSE or 
+                    target.role == NodeRole.ARTICLE or
+                    re.match(r'^\d+\.', target.text[:10] if target.text else '')
+                )
+                if is_clause_heading:
+                    # Body is likely the next paragraph(s) - find last one
+                    # Check children first
+                    if target.children_ids:
+                        last = self.structure.get_last_descendant(target)
+                        para_index = last.paragraph_index
+                    else:
+                        # No children tracked - assume body is next paragraph
+                        # Look for next paragraph that isn't a new clause heading
+                        next_idx = target.paragraph_index + 1
+                        max_idx = max(n.paragraph_index for n in self.structure.nodes)
+                        
+                        while next_idx <= max_idx:
+                            next_node = self.structure.get_node_by_index(next_idx)
+                            if next_node:
+                                # Stop if we hit another numbered clause
+                                if re.match(r'^\d+\.', next_node.text[:10] if next_node.text else ''):
+                                    break
+                                # This is body content
+                                para_index = next_idx
+                            next_idx += 1
+                        else:
+                            para_index = target.paragraph_index
+                        
+                        # If we never found body, use heading index
+                        if 'para_index' not in dir():
+                            para_index = target.paragraph_index
+                else:
+                    para_index = target.paragraph_index
+            else:
+                # Original logic for Word auto-numbered documents
+                last = self.structure.get_last_descendant(target)
+                para_index = last.paragraph_index
             insert_after = True
         
         elif op.position == InsertPosition.FIRST_CHILD:
