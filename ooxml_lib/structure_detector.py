@@ -137,6 +137,36 @@ class StructureMap:
             return 0
         return max(n.level for n in self.nodes)
     
+    def get_last_paragraph_of_clause(self, clause_node: 'StructureNode') -> int:
+        """
+        Find the last paragraph belonging to a clause.
+        
+        For headed documents where clause heading and body are separate paragraphs:
+        - Given: clause "4. Governing Law" at p16 (heading)
+        - Returns: p17 (last body paragraph before clause 5)
+        
+        Walks forward from the heading until hitting the next numbered clause.
+        """
+        if not self.nodes:
+            return clause_node.paragraph_index
+        
+        last_body_idx = clause_node.paragraph_index
+        current_idx = clause_node.paragraph_index + 1
+        max_idx = max(n.paragraph_index for n in self.nodes)
+        
+        while current_idx <= max_idx:
+            current_node = self.get_node_by_index(current_idx)
+            if current_node:
+                # Stop if we hit another numbered clause heading
+                text_preview = current_node.text[:10] if current_node.text else ''
+                if re.match(r'^\d+\.', text_preview):
+                    break
+                # This paragraph belongs to our clause
+                last_body_idx = current_idx
+            current_idx += 1
+        
+        return last_body_idx
+    
     def find_node_by_id(self, node_id: str) -> Optional[StructureNode]:
         """
         Alias for get_node_by_id.

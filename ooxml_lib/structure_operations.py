@@ -266,7 +266,6 @@ class OperationResolver:
         elif op.position == InsertPosition.AFTER_SECTION:
             # For headed documents (manual numbering without Word auto-numbering),
             # we need to find the LAST paragraph belonging to this clause
-            # (clause heading at paragraph N, body at N+1, N+2, etc.)
             if self.structure.has_manual_numbering and not self.structure.has_word_numbering:
                 # Check if target is a clause heading (has number like "4.")
                 is_clause_heading = (
@@ -275,26 +274,11 @@ class OperationResolver:
                     re.match(r'^\d+\.', target.text[:10] if target.text else '')
                 )
                 if is_clause_heading:
-                    # Start from the heading and walk forward to find last body paragraph
-                    # Stop when we hit the next numbered clause or end of document
-                    last_body_idx = target.paragraph_index
-                    current_idx = target.paragraph_index + 1
-                    max_idx = max(n.paragraph_index for n in self.structure.nodes)
-                    
-                    while current_idx <= max_idx:
-                        current_node = self.structure.get_node_by_index(current_idx)
-                        if current_node:
-                            # Stop if we hit another numbered clause heading
-                            if re.match(r'^\d+\.', current_node.text[:10] if current_node.text else ''):
-                                break
-                            # This paragraph belongs to our clause - update last body
-                            last_body_idx = current_idx
-                        current_idx += 1
-                    
-                    para_index = last_body_idx
+                    # Use helper to find last body paragraph
+                    para_index = self.structure.get_last_paragraph_of_clause(target)
                     logger = logging.getLogger(__name__)
                     logger.info(f"  AFTER_SECTION: clause heading at {target.paragraph_index}, "
-                               f"body ends at {para_index}")
+                               f"last body at {para_index}")
                 else:
                     para_index = target.paragraph_index
             else:
