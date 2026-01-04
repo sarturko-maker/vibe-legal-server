@@ -68,6 +68,8 @@ class StructureMap:
     has_sections: bool
     has_manual_numbering: bool
     has_word_numbering: bool
+    has_heading_styles: bool = False
+    heading_style_name: Optional[str] = None
     
     # =========================================================================
     # BASIC NODE ACCESS
@@ -385,6 +387,8 @@ def detect_structure(docx_bytes: bytes) -> StructureMap:
     has_sections = False
     has_manual_numbering = False
     has_word_numbering = False
+    has_heading_styles = False
+    heading_style_name = None
     
     prev_role = None
     parent_stack = []  # Stack of (node_id, level, role)
@@ -399,8 +403,18 @@ def detect_structure(docx_bytes: bytes) -> StructureMap:
         is_bold = False
         is_all_caps = False
         indent_level = 0
+        para_style = None
         
         if pPr is not None:
+            # Check for paragraph style (Heading1, Heading2, etc.)
+            pStyle = pPr.find(f'{W}pStyle')
+            if pStyle is not None:
+                para_style = pStyle.get(f'{W}val')
+                if para_style and para_style.lower().startswith('heading'):
+                    has_heading_styles = True
+                    if heading_style_name is None:
+                        heading_style_name = para_style
+            
             rPr = pPr.find(f'{W}rPr')
             if rPr is not None:
                 is_bold = rPr.find(f'{W}b') is not None
@@ -515,7 +529,9 @@ def detect_structure(docx_bytes: bytes) -> StructureMap:
         confidence=confidence,
         has_sections=has_sections,
         has_manual_numbering=has_manual_numbering,
-        has_word_numbering=has_word_numbering
+        has_word_numbering=has_word_numbering,
+        has_heading_styles=has_heading_styles,
+        heading_style_name=heading_style_name
     )
 
 

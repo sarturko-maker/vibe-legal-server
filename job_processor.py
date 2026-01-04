@@ -402,16 +402,38 @@ def apply_operations_in_order(
                 context['sub_number'] = 1
                 context['parent_number'] = num_val.rstrip('.')
             
-            # Use smart_insert which handles all style matching
+            # Detect document type and use appropriate INSERT method
             if resolved.insert_after:
                 if title and body:
-                    # Clear "Title. Body" format - use smart_insert
-                    result = style_editor.smart_insert(
-                        resolved.paragraph_index,
-                        title,
-                        body,
-                        context
-                    )
+                    # Document type detection:
+                    # 1. Word auto-numbered lists (has numPr) → insert_numbered_clause
+                    # 2. Heading styles (Heading2, etc.) with manual numbers → insert_styled_clause
+                    # 3. Otherwise → smart_insert fallback
+                    
+                    if structure.has_word_numbering:
+                        # Word auto-numbered lists - copy numPr to join list
+                        result = style_editor.insert_numbered_clause(
+                            resolved.paragraph_index,
+                            title,
+                            body
+                        )
+                    elif structure.has_heading_styles:
+                        # Documents with heading styles and manual numbers
+                        heading_style = structure.heading_style_name or "Heading2"
+                        result = style_editor.insert_styled_clause(
+                            resolved.paragraph_index,
+                            title,
+                            body,
+                            heading_style=heading_style
+                        )
+                    else:
+                        # Fallback to smart_insert for other document types
+                        result = style_editor.smart_insert(
+                            resolved.paragraph_index,
+                            title,
+                            body,
+                            context
+                        )
                 else:
                     # No clear title - insert as plain paragraph
                     result = style_editor.insert_plain_paragraph(
