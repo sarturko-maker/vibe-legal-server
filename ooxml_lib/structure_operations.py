@@ -237,6 +237,18 @@ class OperationResolver:
         """Resolve an INSERT operation."""
         target, method = self._find_target(op)
         
+        # Debug logging
+        if target:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"  _resolve_insert: Found target '{target.id}' at para {target.paragraph_index} "
+                       f"text='{target.text[:30] if target.text else ''}...' via {method}")
+        else:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"  _resolve_insert: Target NOT found for clause={op.target_clause_number} "
+                       f"section={op.target_section} node_id={op.target_node_id}")
+        
         if target is None:
             return None
         

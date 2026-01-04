@@ -396,6 +396,9 @@ def apply_operations_in_order(
         else:
             resolved = resolver.resolve(op)
             if resolved:
+                logger.info(f"  Resolved INSERT: para_index={resolved.paragraph_index}, "
+                           f"insert_after={resolved.insert_after}, "
+                           f"content={resolved.content[:40] if resolved.content else 'None'}...")
                 resolved_inserts.append((resolved, op))
             else:
                 failed += 1
