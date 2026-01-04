@@ -70,6 +70,7 @@ class StructureMap:
     has_word_numbering: bool
     has_heading_styles: bool = False
     heading_style_name: Optional[str] = None
+    has_bullet_sections: bool = False  # Bold section headings followed by bullet lists
     
     # =========================================================================
     # BASIC NODE ACCESS
@@ -523,6 +524,23 @@ def detect_structure(docx_bytes: bytes) -> StructureMap:
         structure_type = "SIMPLE"
         confidence = 0.6
     
+    # Detect bullet sections: section headings (no numPr) followed by bullet items (with numPr)
+    # This is a common pattern where OBLIGATIONS: is a heading, followed by bullet points
+    has_bullet_sections = False
+    if has_sections and has_word_numbering:
+        # Check if section headings are NOT numbered but followed by numbered items
+        section_nodes = [n for n in nodes if n.role == NodeRole.SECTION_HEAD]
+        bullet_nodes = [n for n in nodes if n.role == NodeRole.LIST_ITEM]
+        if section_nodes and bullet_nodes:
+            # Sections exist and bullets exist - likely bullet section pattern
+            # Additional check: ensure sections don't have manual numbering
+            section_has_manual_num = any(
+                n.numbering_info and n.numbering_info.get('type') in ('clause', 'article')
+                for n in section_nodes
+            )
+            if not section_has_manual_num:
+                has_bullet_sections = True
+    
     return StructureMap(
         nodes=nodes,
         structure_type=structure_type,
@@ -531,7 +549,8 @@ def detect_structure(docx_bytes: bytes) -> StructureMap:
         has_manual_numbering=has_manual_numbering,
         has_word_numbering=has_word_numbering,
         has_heading_styles=has_heading_styles,
-        heading_style_name=heading_style_name
+        heading_style_name=heading_style_name,
+        has_bullet_sections=has_bullet_sections
     )
 
 

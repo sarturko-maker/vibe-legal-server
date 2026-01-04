@@ -485,6 +485,107 @@ class StyleAwareEditor:
         
         return last_num_before + 1
     
+    def insert_section_heading(self, after_index: int, heading_text: str, body_text: str, 
+                               spacing_after: bool = False) -> bool:
+        """
+        Insert a section heading + body paragraph (for bullet-point documents).
+        
+        Use this for documents where clauses are section headings (bold, no bullets)
+        followed by bullet lists, like:
+            OBLIGATIONS:
+            • Item 1
+            • Item 2
+        """
+        paragraphs = self.body.findall(f'{W}p')
+        if after_index < 0 or after_index >= len(paragraphs):
+            return False
+        
+        target = paragraphs[after_index]
+        
+        if after_index in self._last_insert_at:
+            last = self._last_insert_at[after_index]
+            if last.getparent() is not None:
+                target = last
+        
+        # HEADING paragraph - bold, with spacing before
+        heading_para = etree.Element(f'{W}p')
+        pPr = etree.SubElement(heading_para, f'{W}pPr')
+        spacing = etree.SubElement(pPr, f'{W}spacing')
+        spacing.set(f'{W}before', '240')  # ~12pt space before
+        
+        ins = etree.SubElement(heading_para, f'{W}ins', self._create_tc_attrs())
+        run = etree.SubElement(ins, f'{W}r')
+        rPr = etree.SubElement(run, f'{W}rPr')
+        etree.SubElement(rPr, f'{W}b')  # Bold
+        t = etree.SubElement(run, f'{W}t')
+        t.text = heading_text
+        
+        target.addnext(heading_para)
+        
+        # BODY paragraph
+        body_para = etree.Element(f'{W}p')
+        
+        if spacing_after:
+            body_pPr = etree.SubElement(body_para, f'{W}pPr')
+            body_spacing = etree.SubElement(body_pPr, f'{W}spacing')
+            body_spacing.set(f'{W}after', '240')  # ~12pt space after
+        
+        ins_body = etree.SubElement(body_para, f'{W}ins', self._create_tc_attrs())
+        body_run = etree.SubElement(ins_body, f'{W}r')
+        body_t = etree.SubElement(body_run, f'{W}t')
+        body_t.text = body_text
+        
+        heading_para.addnext(body_para)
+        self._last_insert_at[after_index] = body_para
+        return True
+    
+    def insert_manual_numbered_clause(self, after_index: int, number: int, 
+                                       title: str, body: str, bold_title: bool = False) -> bool:
+        """
+        Insert a clause with manual number like '5. Title. Body...'
+        
+        Use this for documents with manual text numbering (no Word numPr).
+        Set bold_title based on whether original document uses bold for clause titles.
+        """
+        paragraphs = self.body.findall(f'{W}p')
+        if after_index < 0 or after_index >= len(paragraphs):
+            return False
+        
+        target = paragraphs[after_index]
+        
+        if after_index in self._last_insert_at:
+            last = self._last_insert_at[after_index]
+            if last.getparent() is not None:
+                target = last
+        
+        # Strip any AI-provided numbers
+        title = strip_leading_number(title)
+        
+        new_para = etree.Element(f'{W}p')
+        ins = etree.SubElement(new_para, f'{W}ins', self._create_tc_attrs())
+        
+        if bold_title:
+            # Bold number + title, normal body
+            title_run = etree.SubElement(ins, f'{W}r')
+            title_rPr = etree.SubElement(title_run, f'{W}rPr')
+            etree.SubElement(title_rPr, f'{W}b')
+            title_t = etree.SubElement(title_run, f'{W}t')
+            title_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            title_t.text = f"{number}. {title}. "
+            
+            body_run = etree.SubElement(ins, f'{W}r')
+            body_t = etree.SubElement(body_run, f'{W}t')
+            body_t.text = body
+        else:
+            # All plain text - no bold
+            run = etree.SubElement(ins, f'{W}r')
+            t = etree.SubElement(run, f'{W}t')
+            t.text = f"{number}. {title}. {body}"
+        
+        target.addnext(new_para)
+        self._last_insert_at[after_index] = new_para
+        return True
+    
     def insert_with_underline_title(self, after_index: int, title: str, body: str) -> bool:
         """Insert paragraph with underlined title and normal body."""
         target, original_para = self._get_insert_target(after_index)

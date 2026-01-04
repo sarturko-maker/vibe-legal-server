@@ -170,6 +170,50 @@ SECTION_HEAD, ARTICLE, CLAUSE, SUB_CLAUSE, LIST_ITEM, BODY, DEFINITION
 
 
 # =============================================================================
+# HELPER FUNCTIONS FOR DOCUMENT TYPE DETECTION
+# =============================================================================
+
+W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+
+def _detect_bold_titles(style_editor, structure) -> bool:
+    """
+    Detect if clause titles in manual-numbered docs use bold.
+    Checks first few numbered clauses for bold formatting.
+    """
+    for node in structure.nodes[:10]:
+        if re.match(r'^\d+\.', node.text[:10] if len(node.text) > 10 else node.text):
+            # Found a numbered clause - check if bold
+            paragraphs = style_editor.body.findall(f'{W}p')
+            if node.paragraph_index < len(paragraphs):
+                para = paragraphs[node.paragraph_index]
+                first_run = para.find(f'{W}r')
+                if first_run is not None:
+                    rPr = first_run.find(f'{W}rPr')
+                    if rPr is not None and rPr.find(f'{W}b') is not None:
+                        return True
+                return False  # Found numbered clause, not bold
+    return False  # Default
+
+
+def _calculate_next_manual_clause_number(after_index: int, structure) -> int:
+    """
+    Calculate the next clause number for manual-numbered documents.
+    Finds the highest numbered clause at or before after_index and returns +1.
+    """
+    last_num_before = 0
+    
+    for node in structure.nodes:
+        if node.paragraph_index <= after_index:
+            match = re.match(r'^(\d+)\.', node.text[:10] if len(node.text) > 10 else node.text)
+            if match:
+                num = int(match.group(1))
+                if num > last_num_before:
+                    last_num_before = num
+    
+    return last_num_before + 1
+
+
+# =============================================================================
 # PARSING AI OPERATIONS
 # =============================================================================
 
@@ -405,12 +449,41 @@ def apply_operations_in_order(
             # Detect document type and use appropriate INSERT method
             if resolved.insert_after:
                 if title and body:
-                    # Document type detection:
-                    # 1. Word auto-numbered lists (has numPr) → insert_numbered_clause
-                    # 2. Heading styles (Heading2, etc.) with manual numbers → insert_styled_clause
-                    # 3. Otherwise → smart_insert fallback
+                    # Document type detection priority:
+                    # 1. Bullet sections (section headings + bullet lists) → insert_section_heading
+                    # 2. Manual numbering without Word numPr → insert_manual_numbered_clause
+                    # 3. Word auto-numbered lists → insert_numbered_clause
+                    # 4. Heading styles (Heading2, etc.) → insert_styled_clause
+                    # 5. Fallback → smart_insert
                     
-                    if structure.has_word_numbering:
+                    if structure.has_bullet_sections:
+                        # Bullet-point documents with section headings (OBLIGATIONS:)
+                        # Create uppercase heading with colon
+                        heading = title.upper()
+                        if not heading.endswith(':'):
+                            heading += ':'
+                        result = style_editor.insert_section_heading(
+                            resolved.paragraph_index,
+                            heading,
+                            body,
+                            spacing_after=False
+                        )
+                    elif structure.has_manual_numbering and not structure.has_word_numbering:
+                        # Manual numbered docs (1., 2., 3.) - not Word auto-numbered
+                        # Detect if original uses bold titles
+                        bold_titles = _detect_bold_titles(style_editor, structure)
+                        # Calculate the next clause number
+                        clause_num = _calculate_next_manual_clause_number(
+                            resolved.paragraph_index, structure
+                        )
+                        result = style_editor.insert_manual_numbered_clause(
+                            resolved.paragraph_index,
+                            clause_num,
+                            title,
+                            body,
+                            bold_title=bold_titles
+                        )
+                    elif structure.has_word_numbering:
                         # Word auto-numbered lists - copy numPr to join list
                         result = style_editor.insert_numbered_clause(
                             resolved.paragraph_index,
