@@ -45,7 +45,7 @@ class OperationType(str, Enum):
     DELETE = "DELETE"
     INSERT_CLAUSE = "INSERT_CLAUSE"  # Legacy: text-search based
     INSERT = "INSERT"                 # New: structure-aware
-    INSERT_WITH_CHILDREN = "INSERT_WITH_CHILDREN"  # New: hierarchical
+    # DEPRECATED: INSERT_WITH_CHILDREN removed - use multiple INSERT operations
 
 class AiOperation(BaseModel):
     type: OperationType
@@ -63,7 +63,7 @@ class StructureAwareOperation(BaseModel):
     Structure-aware operation that references targets by section/clause/node_id
     instead of text search. This avoids "anchor not found" errors.
     """
-    type: str  # AMEND, INSERT, INSERT_WITH_CHILDREN, DELETE
+    type: str  # AMEND, INSERT, DELETE
     
     # Target identification (use ONE of these)
     target_section: Optional[str] = None       # Section title: "BETWEEN", "OBLIGATIONS"
@@ -76,7 +76,7 @@ class StructureAwareOperation(BaseModel):
     new_role: Optional[str] = None             # SECTION_HEAD, CLAUSE, LIST_ITEM, etc.
     new_content: Optional[str] = None
     
-    # For INSERT_WITH_CHILDREN (hierarchical inserts)
+    # Legacy field - no longer used
     content_tree: Optional[dict] = None        # {"role": "...", "text": "...", "children": [...]}
     
     # For AMEND

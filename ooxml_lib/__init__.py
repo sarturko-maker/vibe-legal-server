@@ -37,7 +37,10 @@ try:
 except ImportError:
     pass
 
-__version__ = "0.6.0"
+# Styler (post-processing)
+from .styler import Styler, StylerResult
+
+__version__ = "0.7.0"
 __all__ = [
     # Editors
     'DocumentEditor',
@@ -56,4 +59,7 @@ __all__ = [
     'ContentNode',
     'generate_structure_prompt',
     'generate_full_ai_prompt',
+    # Styler
+    'Styler',
+    'StylerResult',
 ]

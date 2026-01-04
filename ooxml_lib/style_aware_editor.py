@@ -14,7 +14,12 @@ from copy import deepcopy
 from lxml import etree
 import zipfile
 import re
+import logging
 from datetime import datetime
+from typing import Optional
+from diff_match_patch import diff_match_patch
+
+logger = logging.getLogger(__name__)
 
 W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 
@@ -128,6 +133,59 @@ class StyleAwareEditor:
         text = re.sub(r'\s+', ' ', text)
         
         return text.strip().lower()
+    
+    def _diff_words(self, old_text: str, new_text: str) -> list:
+        """
+        Word-level diff like lawyers do (not character-level).
+        
+        Lawyers redline at word boundaries, not mid-word.
+        Example:
+          Character diff: DELETE "English law and t" + INSERT "the laws..."
+          Word diff:      DELETE "English law and the" + INSERT "the laws..."
+        
+        Returns list of (op, text) tuples where op is:
+          0  = EQUAL (unchanged)
+          -1 = DELETE
+          1  = INSERT
+        """
+        import re
+        dmp = diff_match_patch()
+        
+        # Tokenize into words (preserving spaces)
+        def tokenize(text):
+            return re.findall(r'\S+|\s+', text)
+        
+        old_tokens = tokenize(old_text)
+        new_tokens = tokenize(new_text)
+        
+        # Create char mapping (each unique token = one char)
+        token_to_char = {}
+        char_to_token = []
+        
+        def encode(tokens):
+            result = []
+            for token in tokens:
+                if token not in token_to_char:
+                    token_to_char[token] = chr(len(char_to_token))
+                    char_to_token.append(token)
+                result.append(token_to_char[token])
+            return ''.join(result)
+        
+        old_encoded = encode(old_tokens)
+        new_encoded = encode(new_tokens)
+        
+        # Diff the encoded strings (word-by-word)
+        diffs = dmp.diff_main(old_encoded, new_encoded)
+        dmp.diff_cleanupSemantic(diffs)
+        
+        # Decode back to human-readable text
+        result = []
+        for op, chars in diffs:
+            text = ''.join(char_to_token[ord(c)] for c in chars)
+            if text:  # Skip empty
+                result.append((op, text))
+        
+        return result
     
     def _find_para_containing(self, text: str):
         """Find paragraph containing the given text (normalized comparison)."""
@@ -539,13 +597,13 @@ class StyleAwareEditor:
         self._last_insert_at[after_index] = body_para
         return True
     
-    def insert_manual_numbered_clause(self, after_index: int, number: int, 
+    def insert_manual_numbered_clause(self, after_index: int, number: Optional[int], 
                                        title: str, body: str, bold_title: bool = False) -> bool:
         """
         Insert a clause with manual number like '5. Title. Body...'
         
-        Use this for documents with manual text numbering (no Word numPr).
-        Set bold_title based on whether original document uses bold for clause titles.
+        If number is None, does NOT prepend number (assumes title has it).
+        Also skips stripping if number is None.
         """
         paragraphs = self.body.findall(f'{W}p')
         if after_index < 0 or after_index >= len(paragraphs):
@@ -558,11 +616,16 @@ class StyleAwareEditor:
             if last.getparent() is not None:
                 target = last
         
-        # Strip any AI-provided numbers
-        title = strip_leading_number(title)
+        # Only strip if we are providing the number
+        if number is not None:
+            title = strip_leading_number(title)
         
         new_para = etree.Element(f'{W}p')
         ins = etree.SubElement(new_para, f'{W}ins', self._create_tc_attrs())
+        
+        clause_text = ""
+        if number is not None:
+            clause_text = f"{number}. "
         
         if bold_title:
             # Bold number + title, normal body
@@ -571,7 +634,7 @@ class StyleAwareEditor:
             etree.SubElement(title_rPr, f'{W}b')
             title_t = etree.SubElement(title_run, f'{W}t')
             title_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-            title_t.text = f"{number}. {title}. "
+            title_t.text = f"{clause_text}{title}. "
             
             body_run = etree.SubElement(ins, f'{W}r')
             body_t = etree.SubElement(body_run, f'{W}t')
@@ -580,10 +643,248 @@ class StyleAwareEditor:
             # All plain text - no bold
             run = etree.SubElement(ins, f'{W}r')
             t = etree.SubElement(run, f'{W}t')
-            t.text = f"{number}. {title}. {body}"
+            t.text = f"{clause_text}{title}. {body}"
         
         target.addnext(new_para)
         self._last_insert_at[after_index] = new_para
+        return True
+    
+    def insert_clause(self, after_index: int, clause_num: Optional[int], 
+                      title: str, body: str) -> bool:
+        """
+        Simplified clause insert - the primary method for the decision tree.
+        
+        If clause_num is provided, formats as "N. Title. Body"
+        If clause_num is None, formats as "Title. Body" (Word handles numbering)
+        
+        Styling is minimal - the AI corrector will fix formatting later.
+        """
+        paragraphs = self.body.findall(f'{W}p')
+        if after_index < 0 or after_index >= len(paragraphs):
+            logger.warning(f"insert_clause: Index {after_index} out of bounds")
+            return False
+        
+        target = paragraphs[after_index]
+        
+        if after_index in self._last_insert_at:
+            last = self._last_insert_at[after_index]
+            if last.getparent() is not None:
+                target = last
+        
+        # Build content
+        if clause_num is not None:
+            content = f"{clause_num}. {title}. {body}"
+        else:
+            content = f"{title}. {body}" if title else body
+        
+        # Create paragraph with track changes
+        new_para = etree.Element(f'{W}p')
+        ins = etree.SubElement(new_para, f'{W}ins', self._create_tc_attrs())
+        run = etree.SubElement(ins, f'{W}r')
+        t = etree.SubElement(run, f'{W}t')
+        t.text = content
+        
+        target.addnext(new_para)
+        self._last_insert_at[after_index] = new_para
+        logger.info(f"insert_clause: Inserted after p{after_index}, num={clause_num}")
+        return True
+    
+    def insert_with_format(self, after_index: int, format_label: str, content: str) -> bool:
+        """
+        Insert paragraph with specified format - ONE METHOD TO RULE THEM ALL.
+        
+        AI specifies format, system just applies it. No transformation, no guessing.
+        
+        Format labels:
+        - BOLD: Apply bold to paragraph
+        - BULLET: Add bullet formatting  
+        - NUMBERED: Add to Word numbering sequence
+        - NUMBERED_MANUAL: Insert as-is (AI includes number in content)
+        - INDENTED: Apply paragraph indent
+        - PLAIN: Just insert text
+        - BOLD+INDENTED: Combine formats
+        """
+        paragraphs = self.body.findall(f'{W}p')
+        if after_index < 0 or after_index >= len(paragraphs):
+            logger.warning(f"insert_with_format: Index {after_index} out of bounds")
+            return False
+        
+        target = paragraphs[after_index]
+        
+        # Handle multiple inserts at same position
+        if after_index in self._last_insert_at:
+            last = self._last_insert_at[after_index]
+            if last.getparent() is not None:
+                target = last
+        
+        # Parse combined format labels
+        formats = format_label.upper().split('+')
+        
+        # Create paragraph
+        new_para = etree.Element(f'{W}p')
+        pPr = etree.SubElement(new_para, f'{W}pPr')
+        
+        # Apply INDENTED format
+        if 'INDENTED' in formats:
+            ind = etree.SubElement(pPr, f'{W}ind')
+            ind.set(f'{W}left', '720')  # ~0.5 inch indent
+        
+        # Apply BULLET or NUMBERED format - copy numPr from target or nearby paragraph
+        # Both use same OOXML mechanism (numPr), Word distinguishes by numId
+        if 'BULLET' in formats or 'NUMBERED' in formats:
+            # First try target paragraph
+            numPr_found = None
+            target_pPr = target.find(f'{W}pPr')
+            if target_pPr is not None:
+                numPr_found = target_pPr.find(f'{W}numPr')
+            
+            # If target doesn't have numPr, search nearby paragraphs
+            if numPr_found is None:
+                paragraphs = self.body.findall(f'{W}p')
+                for search_idx in range(max(0, after_index - 3), min(len(paragraphs), after_index + 3)):
+                    search_para = paragraphs[search_idx]
+                    search_pPr = search_para.find(f'{W}pPr')
+                    if search_pPr is not None:
+                        numPr_found = search_pPr.find(f'{W}numPr')
+                        if numPr_found is not None:
+                            logger.info(f"insert_with_format: Found numPr at p{search_idx}")
+                            break
+            
+            if numPr_found is not None:
+                import copy
+                pPr.append(copy.deepcopy(numPr_found))
+                logger.info(f"insert_with_format: Applied numPr for {format_label}")
+            else:
+                logger.warning(f"insert_with_format: No numPr found for {format_label}, paragraph will be unnumbered")
+        
+        # Create track change wrapper
+        ins = etree.SubElement(new_para, f'{W}ins', self._create_tc_attrs())
+        run = etree.SubElement(ins, f'{W}r')
+        
+        # Apply BOLD format to run
+        if 'BOLD' in formats:
+            rPr = etree.SubElement(run, f'{W}rPr')
+            etree.SubElement(rPr, f'{W}b')
+        
+        # Add text
+        t = etree.SubElement(run, f'{W}t')
+        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        t.text = content
+        
+        # Insert after target
+        target.addnext(new_para)
+        self._last_insert_at[after_index] = new_para
+        logger.info(f"insert_with_format: Inserted {format_label} after p{after_index}")
+        return True
+    
+    def insert_with_format_before(self, before_index: int, format_label: str, content: str) -> bool:
+        """
+        Insert paragraph with specified format BEFORE the target paragraph.
+        
+        Same formatting logic as insert_with_format, but uses addprevious().
+        """
+        paragraphs = self.body.findall(f'{W}p')
+        if before_index < 0 or before_index >= len(paragraphs):
+            logger.warning(f"insert_with_format_before: Index {before_index} out of bounds")
+            return False
+        
+        target = paragraphs[before_index]
+        
+        # Parse combined format labels
+        formats = format_label.upper().split('+')
+        
+        # Create paragraph
+        new_para = etree.Element(f'{W}p')
+        pPr = etree.SubElement(new_para, f'{W}pPr')
+        
+        # Apply INDENTED format
+        if 'INDENTED' in formats:
+            ind = etree.SubElement(pPr, f'{W}ind')
+            ind.set(f'{W}left', '720')
+        
+        # Apply BULLET or NUMBERED format - copy numPr from target or nearby paragraph
+        if 'BULLET' in formats or 'NUMBERED' in formats:
+            numPr_found = None
+            target_pPr = target.find(f'{W}pPr')
+            if target_pPr is not None:
+                numPr_found = target_pPr.find(f'{W}numPr')
+            
+            # If target doesn't have numPr, search nearby paragraphs
+            if numPr_found is None:
+                for search_idx in range(max(0, before_index - 3), min(len(paragraphs), before_index + 3)):
+                    search_para = paragraphs[search_idx]
+                    search_pPr = search_para.find(f'{W}pPr')
+                    if search_pPr is not None:
+                        numPr_found = search_pPr.find(f'{W}numPr')
+                        if numPr_found is not None:
+                            logger.info(f"insert_with_format_before: Found numPr at p{search_idx}")
+                            break
+            
+            if numPr_found is not None:
+                import copy
+                pPr.append(copy.deepcopy(numPr_found))
+                logger.info(f"insert_with_format_before: Applied numPr for {format_label}")
+            else:
+                logger.warning(f"insert_with_format_before: No numPr found for {format_label}")
+        
+        # Create track change wrapper
+        ins = etree.SubElement(new_para, f'{W}ins', self._create_tc_attrs())
+        run = etree.SubElement(ins, f'{W}r')
+        
+        # Apply BOLD format to run
+        if 'BOLD' in formats:
+            rPr = etree.SubElement(run, f'{W}rPr')
+            etree.SubElement(rPr, f'{W}b')
+        
+        # Add text
+        t = etree.SubElement(run, f'{W}t')
+        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        t.text = content
+        
+        # Insert BEFORE target (key difference)
+        target.addprevious(new_para)
+        logger.info(f"insert_with_format_before: Inserted {format_label} before p{before_index}")
+        return True
+    
+    def insert_section_with_body(self, after_index: int, heading: str, body: str) -> bool:
+        """
+        Simplified section insert for bullet-point documents.
+        
+        Inserts heading (uppercase with colon) followed by body paragraph.
+        Styling is minimal - the AI corrector will fix formatting later.
+        """
+        paragraphs = self.body.findall(f'{W}p')
+        if after_index < 0 or after_index >= len(paragraphs):
+            logger.warning(f"insert_section_with_body: Index {after_index} out of bounds")
+            return False
+        
+        target = paragraphs[after_index]
+        
+        if after_index in self._last_insert_at:
+            last = self._last_insert_at[after_index]
+            if last.getparent() is not None:
+                target = last
+        
+        # Create heading paragraph
+        heading_para = etree.Element(f'{W}p')
+        ins1 = etree.SubElement(heading_para, f'{W}ins', self._create_tc_attrs())
+        run1 = etree.SubElement(ins1, f'{W}r')
+        t1 = etree.SubElement(run1, f'{W}t')
+        t1.text = heading
+        
+        # Create body paragraph
+        body_para = etree.Element(f'{W}p')
+        ins2 = etree.SubElement(body_para, f'{W}ins', self._create_tc_attrs())
+        run2 = etree.SubElement(ins2, f'{W}r')
+        t2 = etree.SubElement(run2, f'{W}t')
+        t2.text = body
+        
+        # Insert: heading first, then body
+        target.addnext(heading_para)
+        heading_para.addnext(body_para)
+        
+        self._last_insert_at[after_index] = body_para
+        logger.info(f"insert_section_with_body: Inserted after p{after_index}, heading='{heading[:30]}...'")
         return True
     
     def insert_with_underline_title(self, after_index: int, title: str, body: str) -> bool:
@@ -651,53 +952,59 @@ class StyleAwareEditor:
         else:
             return self.insert_plain_paragraph(after_index, f"{title}. {body}")
     
-    def amend_text(self, old_text: str, new_text: str) -> bool:
+    def amend_text(self, old_text: str, new_text: str, paragraph_index: int = None) -> bool:
         """
-        Amend text in document with normalized matching.
-        """
-        result = self._find_para_containing(old_text)
-        if not result:
-            return False
+        Amend text using diff-match-patch for SURGICAL character-level changes.
         
-        idx, para = result
+        Instead of deleting entire old_text and inserting entire new_text,
+        this creates minimal track changes for each character difference.
+        
+        Example: "English law" → "the laws of England"
+        Creates: DELETE "English law" + INSERT "the laws of England"
+        NOT: DELETE entire clause + INSERT entire clause
+        """
+        # Find the target paragraph
+        if paragraph_index is not None:
+            paragraphs = self._get_paragraphs()
+            if 0 <= paragraph_index < len(paragraphs):
+                para = paragraphs[paragraph_index]
+            else:
+                return False
+        else:
+            result = self._find_para_containing(old_text)
+            if not result:
+                return False
+            _, para = result
+        
         full_text = self._get_para_text(para)
         
-        # Try exact match first
+        # Find old_text position in full paragraph text
         match = re.search(re.escape(old_text), full_text, re.IGNORECASE)
-        if match:
-            start_pos = match.start()
-            end_pos = match.end()
-        else:
+        if not match:
             # Try normalized matching
             full_norm = self._normalize_text(full_text)
             old_norm = self._normalize_text(old_text)
-            
             norm_start = full_norm.find(old_norm)
             if norm_start == -1:
                 return False
-            
-            # Map normalized position back to original
-            norm_idx = 0
-            start_pos = None
-            
-            for i, char in enumerate(full_text):
-                if start_pos is None and norm_idx >= norm_start:
-                    start_pos = i
-                
-                norm_char = char.lower()
-                if norm_char.isspace():
-                    norm_idx += 1
-                elif norm_char:
-                    norm_idx += 1
-            
-            if start_pos is None:
-                return False
-            
-            end_pos = min(start_pos + len(old_text), len(full_text))
+            start_pos = norm_start
+            end_pos = start_pos + len(old_text)
+        else:
+            start_pos = match.start()
+            end_pos = match.end()
         
         actual_old = full_text[start_pos:end_pos]
         
-        # Build character positions
+        # Use WORD-LEVEL diff like lawyers do (not character-level)
+        # This produces redlines at word boundaries, not mid-word
+        diffs = self._diff_words(actual_old, new_text)
+        
+        logger.info(f"amend_text: Word-level diff from '{actual_old[:30]}...' to '{new_text[:30]}...'")
+        for op, text in diffs:
+            op_name = {0: 'EQUAL', -1: 'DELETE', 1: 'INSERT'}.get(op, 'UNKNOWN')
+            logger.info(f"  {op_name}: '{text[:40]}...' " if len(text) > 40 else f"  {op_name}: '{text}'")
+        
+        # Build character positions mapping
         positions = []
         for run in para.findall(f'{W}r'):
             for t in run.findall(f'{W}t'):
@@ -705,54 +1012,75 @@ class StyleAwareEditor:
                     for i, char in enumerate(t.text):
                         positions.append((run, t, i))
         
-        if start_pos >= len(positions) or end_pos > len(positions):
+        if start_pos >= len(positions):
             return False
         
+        # Get target run and its properties
         start_run, start_t, start_i = positions[start_pos]
-        end_run, end_t, end_i = positions[end_pos - 1]
+        rPr = start_run.find(f'{W}rPr')
         
-        if start_t == end_t:
-            original = start_t.text
-            before = original[:start_i]
-            after = original[end_i + 1:]
-            
-            start_t.text = before
-            
-            rPr = start_run.find(f'{W}rPr')
-            
-            del_elem = etree.Element(f'{W}del', self._create_tc_attrs())
-            del_run = etree.SubElement(del_elem, f'{W}r')
+        # Build new paragraph content with track changes
+        # Strategy: Replace the text element content with surgical changes
+        before_text = full_text[:start_pos]
+        after_text = full_text[end_pos:]
+        
+        # Clear the paragraph's runs and rebuild
+        for run in list(para.findall(f'{W}r')):
+            para.remove(run)
+        
+        # Rebuild: before text (plain) + diffs (track changes) + after text (plain)
+        
+        # 1. Before text as plain run
+        if before_text:
+            before_run = etree.SubElement(para, f'{W}r')
             if rPr is not None:
-                del_run.insert(0, deepcopy(rPr))
-            del_text = etree.SubElement(del_run, f'{W}delText')
-            del_text.text = actual_old
-            
-            ins_elem = etree.Element(f'{W}ins', self._create_tc_attrs())
-            ins_run = etree.SubElement(ins_elem, f'{W}r')
-            if rPr is not None:
-                ins_run.insert(0, deepcopy(rPr))
-            ins_text = etree.SubElement(ins_run, f'{W}t')
-            ins_text.text = new_text
-            
-            after_run = None
-            if after:
-                after_run = etree.Element(f'{W}r')
+                before_run.insert(0, deepcopy(rPr))
+            before_t = etree.SubElement(before_run, f'{W}t')
+            before_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            before_t.text = before_text
+        
+        # 2. Apply diffs with track changes
+        for op, text in diffs:
+            if not text:
+                continue
+                
+            if op == 0:  # EQUAL - unchanged text
+                equal_run = etree.SubElement(para, f'{W}r')
                 if rPr is not None:
-                    after_run.insert(0, deepcopy(rPr))
-                after_t = etree.SubElement(after_run, f'{W}t')
-                after_t.text = after
-            
-            parent = start_run.getparent()
-            run_idx = list(parent).index(start_run)
-            
-            if after_run is not None:
-                parent.insert(run_idx + 1, after_run)
-            parent.insert(run_idx + 1, ins_elem)
-            parent.insert(run_idx + 1, del_elem)
-            
-            return True
+                    equal_run.insert(0, deepcopy(rPr))
+                equal_t = etree.SubElement(equal_run, f'{W}t')
+                equal_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                equal_t.text = text
+                
+            elif op == -1:  # DELETE
+                del_elem = etree.SubElement(para, f'{W}del', self._create_tc_attrs())
+                del_run = etree.SubElement(del_elem, f'{W}r')
+                if rPr is not None:
+                    del_run.insert(0, deepcopy(rPr))
+                del_text = etree.SubElement(del_run, f'{W}delText')
+                del_text.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                del_text.text = text
+                
+            elif op == 1:  # INSERT
+                ins_elem = etree.SubElement(para, f'{W}ins', self._create_tc_attrs())
+                ins_run = etree.SubElement(ins_elem, f'{W}r')
+                if rPr is not None:
+                    ins_run.insert(0, deepcopy(rPr))
+                ins_text = etree.SubElement(ins_run, f'{W}t')
+                ins_text.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                ins_text.text = text
         
-        return False
+        # 3. After text as plain run
+        if after_text:
+            after_run = etree.SubElement(para, f'{W}r')
+            if rPr is not None:
+                after_run.insert(0, deepcopy(rPr))
+            after_t = etree.SubElement(after_run, f'{W}t')
+            after_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            after_t.text = after_text
+        
+        logger.info(f"amend_text: Applied surgical changes successfully")
+        return True
     
     def delete_paragraph(self, containing_text: str) -> bool:
         result = self._find_para_containing(containing_text)
@@ -781,9 +1109,11 @@ class StyleAwareEditor:
         """Delete paragraph by index (0-based)."""
         paragraphs = self._get_paragraphs()
         if para_index < 0 or para_index >= len(paragraphs):
+            logger.warning(f"delete_paragraph_by_index: Index {para_index} out of bounds")
             return False
         
         para = paragraphs[para_index]
+        logger.info(f"Deleting paragraph {para_index}")
         
         del_elem = etree.Element(f'{W}del', self._create_tc_attrs())
         
@@ -799,6 +1129,7 @@ class StyleAwareEditor:
         else:
             para.insert(0, del_elem)
         
+        logger.info(f"Successfully added w:del to paragraph {para_index}")
         return True
     
     def insert_paragraph_before_index(self, para_index: int, text: str) -> bool:

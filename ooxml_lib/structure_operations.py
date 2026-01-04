@@ -40,7 +40,7 @@ class InsertPosition(str, Enum):
 class ContentNode:
     """
     A node in a hierarchical content tree.
-    Used for INSERT_WITH_CHILDREN operations.
+    Used for INSERT operations.
     """
     role: NodeRole
     text: str
@@ -64,7 +64,7 @@ class StructureOperation:
     A structure-aware operation to perform.
     AI generates these, code executes them.
     """
-    type: str                            # INSERT, AMEND, DELETE, INSERT_WITH_CHILDREN
+    type: str                            # INSERT, AMEND, DELETE, INSERT
     
     # Target identification (multiple ways to find target)
     target_section: Optional[str] = None      # Section title to find
@@ -76,8 +76,9 @@ class StructureOperation:
     position: InsertPosition = InsertPosition.AFTER
     new_role: Optional[NodeRole] = None       # What role the new content should have
     new_content: Optional[str] = None
+    format: Optional[str] = None              # BOLD, BULLET, NUMBERED, PLAIN, etc.
     
-    # For INSERT_WITH_CHILDREN operations (hierarchical)
+    # For INSERT operations (hierarchical)
     content_tree: Optional[ContentNode] = None
     
     # For AMEND operations  
@@ -125,7 +126,6 @@ class OperationResolver:
         Resolve a structure operation to a paragraph operation.
         
         Returns None if target cannot be found.
-        For INSERT_WITH_CHILDREN, use resolve_hierarchical() instead.
         """
         if op.type == "INSERT":
             return self._resolve_insert(op)
@@ -133,16 +133,12 @@ class OperationResolver:
             return self._resolve_amend(op)
         elif op.type == "DELETE":
             return self._resolve_delete(op)
-        elif op.type == "INSERT_WITH_CHILDREN":
-            # Return first operation; caller should use resolve_hierarchical()
-            results = self.resolve_hierarchical(op)
-            return results[0] if results else None
         else:
             return None
     
     def resolve_hierarchical(self, op: StructureOperation) -> List[ResolvedOperation]:
         """
-        Resolve a hierarchical INSERT_WITH_CHILDREN operation.
+        Resolve a hierarchical INSERT operation.
         
         Returns a LIST of ResolvedOperations in the order they should be executed.
         Each operation's index accounts for previous insertions.
@@ -156,7 +152,7 @@ class OperationResolver:
                 ResolvedOp(index=6, content="Term C..."),  # +3 from previous
             ]
         """
-        if op.type != "INSERT_WITH_CHILDREN" or op.content_tree is None:
+        if op.type != "INSERT" or op.content_tree is None:
             # Fallback to single operation
             single = self.resolve(op)
             return [single] if single else []
@@ -440,8 +436,7 @@ def generate_structure_prompt(structure: StructureMap) -> str:
         "### OPERATION TYPES",
         "",
         "**AMEND** - Change text within an existing paragraph",
-        "**INSERT** - Add a single new paragraph",
-        "**INSERT_WITH_CHILDREN** - Add a section with multiple items (PREFERRED for multi-item inserts)",
+        "**INSERT** - Add new paragraph(s) - use multiple INSERTs for sections with multiple items",
         "**DELETE** - Remove a paragraph",
         "",
         "### INSERT POSITIONS",
@@ -464,23 +459,15 @@ def generate_structure_prompt(structure: StructureMap) -> str:
         "}",
         "```",
         "",
-        "**Hierarchical insert** - Add section WITH children (PREFERRED):",
+        "**Multiple inserts** - Add section with items (all target same paragraph):",
         "```json",
-        "{",
-        "  \"type\": \"INSERT_WITH_CHILDREN\",",
-        "  \"target_section\": \"BETWEEN\",",
-        "  \"position\": \"AFTER_SECTION\",",
-        "  \"content_tree\": {",
-        "    \"role\": \"SECTION_HEAD\",",
-        "    \"text\": \"DEFINITIONS:\",",
-        "    \"children\": [",
-        "      {\"role\": \"LIST_ITEM\", \"text\": \"\\\"Term A\\\" means...\", \"children\": []},",
-        "      {\"role\": \"LIST_ITEM\", \"text\": \"\\\"Term B\\\" means...\", \"children\": []},",
-        "      {\"role\": \"LIST_ITEM\", \"text\": \"\\\"Term C\\\" means...\", \"children\": []}",
-        "    ]",
-        "  }",
-        "}",
+        "[",
+        "  {\"type\": \"INSERT\", \"target_node_id\": \"p8\", \"position\": \"AFTER\", \"new_content\": \"EXCLUSIONS:\"},",
+        "  {\"type\": \"INSERT\", \"target_node_id\": \"p8\", \"position\": \"AFTER\", \"new_content\": \"is or becomes publicly available...\"},",
+        "  {\"type\": \"INSERT\", \"target_node_id\": \"p8\", \"position\": \"AFTER\", \"new_content\": \"was lawfully in possession...\"}",
+        "]",
         "```",
+        "(System processes in reverse order so content appears in correct order)",
         "",
         "**Amend text:**",
         "```json",
@@ -530,7 +517,7 @@ Return a JSON object with an "operations" array:
       "reason": "Why this change"
     }},
     {{
-      "type": "INSERT_WITH_CHILDREN",
+      "type": "INSERT",
       "target_section": "BETWEEN",
       "position": "AFTER_SECTION",
       "content_tree": {{
@@ -549,9 +536,8 @@ Return a JSON object with an "operations" array:
 
 RULES:
 1. For AMEND: Only change the specific text that needs changing
-2. For INSERT_WITH_CHILDREN: Use when adding a section with multiple items
-3. For INSERT: Use when adding a single paragraph only
-4. Always reference targets using section title, clause number, or node ID
-5. Include a reason for each change
-6. Roles must be: SECTION_HEAD, ARTICLE, CLAUSE, SUB_CLAUSE, LIST_ITEM, BODY, DEFINITION
+2. For INSERT: Use multiple INSERT operations targeting same paragraph for multi-item sections
+3. Always reference targets using section title, clause number, or node ID
+4. Include a reason for each change
+5. Roles must be: SECTION_HEAD, ARTICLE, CLAUSE, SUB_CLAUSE, LIST_ITEM, BODY, DEFINITION
 """

@@ -43,6 +43,9 @@ class StructureNode:
     parent_id: Optional[str] = None
     children_ids: List[str] = field(default_factory=list)
     numbering_info: Optional[dict] = None
+    format_label: str = "PLAIN"  # BOLD, BULLET, NUMBERED, NUMBERED_MANUAL, INDENTED, HEADING1, HEADING2, PLAIN
+    is_bold: bool = False
+    is_indented: bool = False
     
     @property
     def text_preview(self) -> str:
@@ -401,6 +404,58 @@ def classify_paragraph_role(text, numbering_info, manual_numbering, is_bold, is_
     return NodeRole.UNKNOWN
 
 
+def detect_format_label(text: str, para_style: Optional[str], numbering_info: Optional[dict], 
+                        manual_numbering: Optional[dict], is_bold: bool, indent_level: int) -> str:
+    """
+    Detect format label for a paragraph based on priority:
+    1. HEADING1/HEADING2 (if has heading style)
+    2. BULLET (if has bullet)
+    3. NUMBERED (if has Word auto-numbering)
+    4. NUMBERED_MANUAL (if text starts with number pattern)
+    5. BOLD (if bold but none of above)
+    6. INDENTED (if indented but none of above)
+    7. PLAIN (default)
+    
+    Can combine: BOLD+INDENTED when both present
+    """
+    labels = []
+    
+    # Check heading styles first (highest priority)
+    if para_style:
+        style_lower = para_style.lower()
+        if style_lower == 'heading1' or style_lower.startswith('heading 1'):
+            return "HEADING1"
+        elif style_lower == 'heading2' or style_lower.startswith('heading 2'):
+            return "HEADING2"
+        elif style_lower.startswith('heading'):
+            return "HEADING2"  # Default to HEADING2 for other heading levels
+    
+    # Check for bullet
+    if numbering_info:
+        # Word numbering format - check if bullet or numbered
+        num_format = numbering_info.get('format', '')
+        if num_format == 'bullet' or num_format == '':
+            return "BULLET"
+        else:
+            return "NUMBERED"
+    
+    # Check for manual numbering in text
+    if manual_numbering:
+        return "NUMBERED_MANUAL"
+    
+    # Build combined label for remaining formats
+    if is_bold:
+        labels.append("BOLD")
+    
+    if indent_level > 0:
+        labels.append("INDENTED")
+    
+    if labels:
+        return "+".join(labels)
+    
+    return "PLAIN"
+
+
 def detect_structure(docx_bytes: bytes) -> StructureMap:
     """Detect structure from document bytes."""
     with zipfile.ZipFile(BytesIO(docx_bytes), 'r') as zf:
@@ -504,8 +559,11 @@ def detect_structure(docx_bytes: bytes) -> StructureMap:
         if parent_stack:
             parent_id = parent_stack[-1][0]
         
-        # Create node
+        # Create node with format_label
         node_id = f"p{idx}"
+        format_label = detect_format_label(
+            text, para_style, numbering_info, manual_numbering, is_bold, indent_level
+        )
         node = StructureNode(
             id=node_id,
             paragraph_index=idx,
@@ -513,7 +571,10 @@ def detect_structure(docx_bytes: bytes) -> StructureMap:
             role=role,
             level=level,
             parent_id=parent_id,
-            numbering_info=numbering_info or manual_numbering
+            numbering_info=numbering_info or manual_numbering,
+            format_label=format_label,
+            is_bold=is_bold,
+            is_indented=(indent_level > 0)
         )
         
         nodes.append(node)
