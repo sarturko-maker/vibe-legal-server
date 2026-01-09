@@ -222,7 +222,7 @@ Always review every change. You are responsible for the final document.
 
 This is **Part 2** of the Vibe Legal project:
 
-- **Part 1** — [Word Add-in](https://github.com/YOUR_USERNAME/VibeLegal) for interactive negotiation
+- **Part 1** — Word Add-Inn for interactive negotiation
 - **Part 2** — This server for batch processing
 - **Part 3** — A vision for what legal workflows could look like (coming soon)
 
