@@ -259,6 +259,28 @@ async def create_playbook(
     
     return {"message": "Playbook created", "playbook": playbook.model_dump()}
 
+# List of default playbook IDs that cannot be deleted
+DEFAULT_PLAYBOOK_IDS = {"nda-standard", "supply-aggressive"}
+
+@app.delete("/api/playbooks/{playbook_id}")
+async def delete_playbook(playbook_id: str):
+    if playbook_id in DEFAULT_PLAYBOOK_IDS:
+        return JSONResponse(content={"error": "Cannot delete default playbooks"}, status_code=400)
+    
+    if playbook_id not in playbooks:
+        return JSONResponse(content={"error": "Playbook not found"}, status_code=404)
+    
+    # Delete the playbook
+    del playbooks[playbook_id]
+    
+    # Also delete the file if it exists
+    playbooks_dir = os.path.join(os.getcwd(), "Playbooks")
+    file_path = os.path.join(playbooks_dir, f"{playbook_id}.docx")
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    
+    return {"message": "Playbook deleted", "id": playbook_id}
+
 
 @app.post("/api/apply-amend")
 async def apply_amend_endpoint(request: LegacyAmendRequest):

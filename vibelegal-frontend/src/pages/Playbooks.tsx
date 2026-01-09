@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
@@ -10,6 +10,9 @@ interface Playbook {
     description: string;
     playbookText: string;
 }
+
+// Default playbooks that cannot be deleted
+const DEFAULT_PLAYBOOK_IDS = ['nda-standard', 'supply-aggressive'];
 
 export const Playbooks = () => {
     const [playbooks, setPlaybooks] = useState<Playbook[]>([]);
@@ -62,6 +65,28 @@ export const Playbooks = () => {
             alert('Error creating playbook');
         }
     };
+
+    const handleDelete = async (playbookId: string, playbookName: string) => {
+        if (!confirm(`Delete "${playbookName}"? This cannot be undone.`)) {
+            return;
+        }
+
+        try {
+            const res = await fetch(`http://localhost:8000/api/playbooks/${playbookId}`, {
+                method: 'DELETE'
+            });
+            if (res.ok) {
+                fetchPlaybooks();
+            } else {
+                const data = await res.json();
+                alert(data.error || 'Failed to delete playbook');
+            }
+        } catch (e) {
+            alert('Error deleting playbook');
+        }
+    };
+
+    const isDefaultPlaybook = (id: string) => DEFAULT_PLAYBOOK_IDS.includes(id);
 
     if (loading) return <div className="text-neutral-500 text-center py-12">Loading playbooks...</div>;
 
@@ -119,14 +144,23 @@ export const Playbooks = () => {
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {playbooks.map(pb => (
-                    <Card key={pb.id} className="hover:border-neutral-300 transition-colors cursor-default">
-                        <div className="mb-2">
-                            <h3 className="text-[15px] font-semibold text-neutral-900">{pb.name}</h3>
-                            <p className="text-[13px] text-neutral-500 mt-1 line-clamp-2">{pb.description}</p>
-                        </div>
-                        <div className="flex gap-2 mt-4 pt-4 border-t border-neutral-100 opacity-0 group-hover:opacity-100 transition-opacity">
-                            {/* Edit actions placeholder */}
-                            <button className="text-[12px] font-medium text-neutral-400 hover:text-neutral-900">Edit</button>
+                    <Card key={pb.id} className="hover:border-neutral-300 transition-colors">
+                        <div className="flex justify-between items-start">
+                            <div className="flex-1">
+                                <h3 className="text-[15px] font-semibold text-neutral-900">{pb.name}</h3>
+                                <p className="text-[13px] text-neutral-500 mt-1 line-clamp-2">{pb.description}</p>
+                            </div>
+                            {!isDefaultPlaybook(pb.id) && (
+                                <button
+                                    onClick={() => handleDelete(pb.id, pb.name)}
+                                    className="ml-4 text-neutral-300 hover:text-red-500 transition-colors"
+                                    title="Delete playbook"
+                                >
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                    </svg>
+                                </button>
+                            )}
                         </div>
                     </Card>
                 ))}

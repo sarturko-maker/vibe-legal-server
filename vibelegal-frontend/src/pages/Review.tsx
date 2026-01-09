@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Card } from '../components/ui/Card';
 import { FileUpload } from '../components/FileUpload';
 import { Button } from '../components/ui/Button';
@@ -13,14 +13,14 @@ interface JobStatus {
     errors: string[];
 }
 
-export const Dashboard = () => {
+export const Review = () => {
     const [file, setFile] = useState<File | null>(null);
     const [playbooks, setPlaybooks] = useState<{ id: string, name: string }[]>([]);
     const [selectedPlaybook, setSelectedPlaybook] = useState('');
     const [job, setJob] = useState<JobStatus | null>(null);
     const [isStarting, setIsStarting] = useState(false);
 
-    const pollInterval = useRef<number>();
+    const pollInterval = useRef<number | undefined>(undefined);
 
     // Fetch playbooks on mount
     useEffect(() => {

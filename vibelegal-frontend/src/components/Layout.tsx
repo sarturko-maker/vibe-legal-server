@@ -1,4 +1,4 @@
-import React from 'react';
+
 import { NavLink, Outlet } from 'react-router-dom';
 import { twMerge } from 'tailwind-merge';
 
@@ -31,7 +31,8 @@ export const Layout = () => {
 
                 {/* Navigation */}
                 <nav className="flex-1 p-4">
-                    <SidebarItem to="/" label="Dashboard" />
+                    <SidebarItem to="/review" label="Review" />
+                    <SidebarItem to="/batch" label="Batch" />
                     <SidebarItem to="/playbooks" label="Playbooks" />
                     <SidebarItem to="/settings" label="Settings" />
                 </nav>

@@ -270,15 +270,84 @@ Do NOT cluster all new clauses at the end after Governing Law.
 
 ### INSERT STRUCTURE RULES
 
+## ⚠️ MANDATORY: STEP 0 - IDENTIFY THE DOCUMENT'S PATTERN FIRST ⚠️
+
+Before generating ANY INSERT operations, you MUST identify which pattern THIS document uses:
+
+**Pattern A: SEPARATE HEADERS (Formal NDAs)**
+Look for this in the structure map:
+- SECTION_HEAD: "RETURN OF INFORMATION" (standalone heading)
+- CLAUSE [5]: "5. Upon written request..." (body paragraph)
+
+If you see SEPARATE heading paragraphs → Generate TWO INSERTs:
+1. SECTION_HEAD for the heading
+2. NUMBERED/CLAUSE for the body
+
+**Pattern B: INLINE TITLES (Simple Contracts)**
+Look for this in the structure map:
+- CLAUSE [1]: "1. Definitions. 'Confidential Information' means..."
+
+If titles are INSIDE clause paragraphs → Generate ONE INSERT with full content.
+
+**HOW TO DETECT:**
+1. Find a SECTION_HEAD in the structure map
+2. Look at the NEXT paragraph - is it a separate CLAUSE body?
+3. YES = Pattern A (separate), NO = Pattern B (inline)
+
+**Example - Pattern A Document (This Test NDA):**
+```
+Structure shows:
+  - SECTION_HEAD: "RETURN OF INFORMATION" (id: p19)
+  - CLAUSE [5]: "5.     Upon written request..." (id: p20)
+```
+To insert new section:
+```json
+[
+  {"type": "INSERT", "target_node_id": "p9", "position": "AFTER", "format": "SECTION_HEAD", "new_content": "EXCLUSIONS"},
+  {"type": "INSERT", "target_node_id": "p9", "position": "AFTER", "format": "NUMBERED", "new_content": "2. Confidential Information shall not include..."}
+]
+```
+
+## ⚠️ CRITICAL: INSERT ORDER MATTERS ⚠️
+
+**For Pattern A documents, you MUST send operations in DISPLAY ORDER:**
+
+1. **Heading FIRST** (SECTION_HEAD format)
+2. **Body SECOND** (NUMBERED/CLAUSE/INDENTED format)
+
+**WRONG ORDER (causes bug):**
+```json
+[
+  {"type": "INSERT", "format": "NUMBERED", "new_content": "Body text..."},
+  {"type": "INSERT", "format": "SECTION_HEAD", "new_content": "Heading"}
+]
+```
+Result: Body appears first, heading appears BELOW it = broken document!
+
+**CORRECT ORDER:**
+```json
+[
+  {"type": "INSERT", "format": "SECTION_HEAD", "new_content": "Heading"},
+  {"type": "INSERT", "format": "NUMBERED", "new_content": "Body text..."}
+]
+```
+Result: Heading appears first, body appears below it = correct!
+
+**The order you list operations = the order they appear in the document.**
+
+---
+
 **Match the document's existing structure.**
 
 Look at the format labels in the structure map. When inserting new content:
 
-1. OBSERVE how existing clauses are structured in THIS document
-2. MATCH that pattern with your inserts
-3. Each INSERT creates ONE paragraph
-4. Send multiple INSERTs if the pattern requires multiple paragraphs
-5. Include the format field matching what you see
+1. **FIRST**: Identify document pattern (A or B) from structure map
+2. OBSERVE how existing clauses are structured in THIS document
+3. MATCH that pattern with your inserts
+4. **SEND HEADING BEFORE BODY** - Order in operations = order in document
+5. Each INSERT creates ONE paragraph
+6. Send multiple INSERTs if the pattern requires multiple paragraphs
+7. Include the format field matching what you see
 
 ---
 
@@ -513,15 +582,21 @@ def parse_ai_operation(op_dict: dict) -> StructureOperation:
         except KeyError:
             logger.warning(f"Unknown position '{op_dict.get('position')}', defaulting to AFTER")
     
-    # Parse role (AI may use 'new_role' or 'format' field)
+    # Parse role (new_role field only - must be valid NodeRole)
     new_role = None
-    role_str = op_dict.get('new_role') or op_dict.get('format')
+    role_str = op_dict.get('new_role')
     if role_str:
         try:
             new_role = NodeRole[role_str]
-            logger.info(f"  Parsed role: {role_str} -> {new_role}")
+            logger.info(f"  Parsed new_role: {role_str} -> {new_role}")
         except KeyError:
-            logger.warning(f"Unknown role '{role_str}'")
+            logger.warning(f"Unknown new_role '{role_str}'")
+    
+    # Parse format separately (NUMBERED, LETTERED, BULLET, etc.)
+    # This is SEPARATE from role - format controls visual styling
+    format_label = op_dict.get('format')
+    if format_label:
+        logger.info(f"  Parsed format: {format_label}")
     
     return StructureOperation(
         type=op_dict.get('type', 'AMEND').upper(),
@@ -532,6 +607,7 @@ def parse_ai_operation(op_dict: dict) -> StructureOperation:
         position=position,
         new_role=new_role,
         new_content=op_dict.get('new_content') or op_dict.get('new_clause_body'),
+        format=format_label,  # NOW PROPERLY PASSED!
         content_tree=content_tree,
         old_text=op_dict.get('old_text') or op_dict.get('original_text') or op_dict.get('find'),
         new_text=op_dict.get('new_text') or op_dict.get('replacement_text') or op_dict.get('replace'),
@@ -659,6 +735,8 @@ def apply_operations_in_order(
     2. DELETE operations in REVERSE index order (highest first)
     3. INSERT operations in REVERSE index order (highest first)
     
+    CRITICAL: DELETEs must run BEFORE INSERTs because INSERTs shift indices!
+    
     Returns (success_count, failed_count)
     """
     resolver = OperationResolver(structure)
@@ -694,6 +772,55 @@ def apply_operations_in_order(
         else:
             failed += 1
             log_operation_result(success + failed, "AMEND", False, "Missing old_text or new_text")
+    
+    # =========================================================================
+    # CRITICAL: Execute DELETEs BEFORE INSERTs to prevent index shift corruption
+    # =========================================================================
+    # DELETEs are resolved and executed FIRST (in reverse index order)
+    # This ensures INSERT operations don't shift the indices that DELETE targets
+    
+    resolved_deletes = []
+    for op in deletes:
+        resolved = resolver.resolve(op)
+        if resolved:
+            # Store target text for verification
+            W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+            paragraphs = style_editor.body.findall(f'{W}p')
+            if 0 <= resolved.paragraph_index < len(paragraphs):
+                para = paragraphs[resolved.paragraph_index]
+                target_text = ''.join(t.text or '' for t in para.findall(f'.//{W}t'))[:50]
+                resolved_deletes.append((resolved, op, target_text))
+            else:
+                resolved_deletes.append((resolved, op, ""))
+        else:
+            failed += 1
+            target = op.target_section or op.target_clause_number or op.target_node_id or "?"
+            log_operation_result(success + failed, "DELETE", False, f"Target '{target}' not found")
+    
+    # Sort by index descending (highest first) to prevent index shift
+    resolved_deletes.sort(key=lambda x: x[0].paragraph_index, reverse=True)
+    
+    # Execute DELETEs with content verification
+    for resolved, original_op, expected_text in resolved_deletes:
+        # Verify paragraph still contains expected content (safety check)
+        W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+        paragraphs = style_editor.body.findall(f'{W}p')
+        if 0 <= resolved.paragraph_index < len(paragraphs):
+            para = paragraphs[resolved.paragraph_index]
+            actual_text = ''.join(t.text or '' for t in para.findall(f'.//{W}t'))[:50]
+            if expected_text and expected_text[:20] not in actual_text:
+                logger.warning(f"DELETE: Content mismatch at p{resolved.paragraph_index}!")
+                logger.warning(f"  Expected: '{expected_text[:30]}...'")
+                logger.warning(f"  Actual: '{actual_text[:30]}...'")
+                # Still proceed but log warning
+        
+        result = style_editor.delete_paragraph_by_index(resolved.paragraph_index)
+        if result:
+            success += 1
+            log_operation_result(success + failed, "DELETE", True, resolved.target_description[:30])
+        else:
+            failed += 1
+            log_operation_result(success + failed, "DELETE", False, f"Index {resolved.paragraph_index} failed")
     
     # --- Resolve all inserts to get indices ---
     resolved_inserts = []
@@ -767,11 +894,20 @@ def apply_operations_in_order(
                 context['sub_number'] = 1
                 context['parent_number'] = num_val.rstrip('.')
             
-            # SIMPLIFIED INSERT: AI specifies role, we map to format_label
-            # Get role from resolved operation (parsed from AI's new_role or format field)
+            # FORMAT LABEL PRIORITY:
+            # 1. AI's explicit format field (NUMBERED, LETTERED, BULLET, etc.)
+            # 2. Mapped from AI's role field (CLAUSE -> NUMBERED, etc.)
+            # 3. Auto-detected from target/nearby paragraphs
+            
             format_label = None
-            if resolved.new_role:
-                # Map role to format label
+            
+            # Priority 1: Direct format from AI
+            if original_op.format:
+                format_label = original_op.format.upper()
+                logger.info(f"  Using AI-specified format: {format_label}")
+            
+            # Priority 2: Map from role
+            elif resolved.new_role:
                 role_to_format = {
                     NodeRole.SECTION_HEAD: 'BOLD',
                     NodeRole.CLAUSE: 'NUMBERED',
@@ -783,7 +919,7 @@ def apply_operations_in_order(
                 format_label = role_to_format.get(resolved.new_role, 'PLAIN')
                 logger.info(f"  Using AI-specified role {resolved.new_role} -> format={format_label}")
             
-            # AUTO-DETECT: If AI didn't provide format, detect from target paragraph
+            # Priority 3: AUTO-DETECT from target paragraph
             if not format_label:
                 # Check if target paragraph has Word numbering (numPr)
                 W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
@@ -818,7 +954,8 @@ def apply_operations_in_order(
                 result = style_editor.insert_with_format(
                     resolved.paragraph_index,
                     format_label,
-                    content
+                    content,
+                    structure=structure
                 )
                 logger.info(f"  INSERT AFTER with format={format_label}: {content[:40]}...")
             else:
@@ -836,29 +973,6 @@ def apply_operations_in_order(
             else:
                 failed += 1
                 log_operation_result(success + failed, "INSERT", False, f"Index {resolved.paragraph_index} failed")
-    
-    # --- Resolve and execute deletes in reverse order ---
-    resolved_deletes = []
-    for op in deletes:
-        resolved = resolver.resolve(op)
-        if resolved:
-            resolved_deletes.append((resolved, op))
-        else:
-            failed += 1
-            target = op.target_section or op.target_clause_number or op.target_node_id or "?"
-            log_operation_result(success + failed, "DELETE", False, f"Target '{target}' not found")
-    
-    # Sort by index descending
-    resolved_deletes.sort(key=lambda x: x[0].paragraph_index, reverse=True)
-    
-    for resolved, original_op in resolved_deletes:
-        result = style_editor.delete_paragraph_by_index(resolved.paragraph_index)
-        if result:
-            success += 1
-            log_operation_result(success + failed, "DELETE", True, resolved.target_description[:30])
-        else:
-            failed += 1
-            log_operation_result(success + failed, "DELETE", False, f"Index {resolved.paragraph_index} failed")
     
     return success, failed
 

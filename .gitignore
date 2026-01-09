@@ -18,9 +18,11 @@ build/
 *.swp
 *.swo
 
-# Uploads and processed files
-Uploads/
-ProcessedDocs/
+# Uploads and processed files (but keep .gitkeep)
+Uploads/*
+!Uploads/.gitkeep
+ProcessedDocs/*
+!ProcessedDocs/.gitkeep
 
 # Logs
 logs/
@@ -28,7 +30,14 @@ logs/
 
 # Node (frontend)
 vibelegal-frontend/node_modules/
+vibelegal-frontend/dist/
 vibelegal-frontend/.env
+
+# Legacy/backup frontend folder
+VibeLegalFrontend/
+
+# Test data
+TestData/
 
 # OS
 .DS_Store

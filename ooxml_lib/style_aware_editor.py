@@ -19,6 +19,12 @@ from datetime import datetime
 from typing import Optional
 from diff_match_patch import diff_match_patch
 
+from .word_position_map import (
+    build_word_map_for_paragraph, 
+    get_formatting_for_char_position,
+    rebuild_runs_for_text_range
+)
+
 logger = logging.getLogger(__name__)
 
 W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
@@ -689,21 +695,22 @@ class StyleAwareEditor:
         logger.info(f"insert_clause: Inserted after p{after_index}, num={clause_num}")
         return True
     
-    def insert_with_format(self, after_index: int, format_label: str, content: str) -> bool:
+    def insert_with_format(self, after_index: int, format_label: str, content: str, structure=None) -> bool:
         """
-        Insert paragraph with specified format - ONE METHOD TO RULE THEM ALL.
+        Insert paragraph with specified format.
         
-        AI specifies format, system just applies it. No transformation, no guessing.
+        Implements REFERENCE MATCHING:
+        1. Use StructureMap to find reference paragraphs by role
+        2. Clone formatting (pStyle, indent, spacing)
+        3. Apply bold pattern for CLAUSE/NUMBERED formats
+        4. If no reference found, apply sensible defaults
         
-        Format labels:
-        - BOLD: Apply bold to paragraph
-        - BULLET: Add bullet formatting  
-        - NUMBERED: Add to Word numbering sequence
-        - NUMBERED_MANUAL: Insert as-is (AI includes number in content)
-        - INDENTED: Apply paragraph indent
-        - PLAIN: Just insert text
-        - BOLD+INDENTED: Combine formats
+        Args:
+            structure: Optional StructureMap for role-based reference finding
         """
+        import copy
+        import re
+        
         paragraphs = self.body.findall(f'{W}p')
         if after_index < 0 or after_index >= len(paragraphs):
             logger.warning(f"insert_with_format: Index {after_index} out of bounds")
@@ -720,56 +727,244 @@ class StyleAwareEditor:
         # Parse combined format labels
         formats = format_label.upper().split('+')
         
-        # Create paragraph
+        # Create new paragraph
         new_para = etree.Element(f'{W}p')
         pPr = etree.SubElement(new_para, f'{W}pPr')
         
-        # Apply INDENTED format
-        if 'INDENTED' in formats:
-            ind = etree.SubElement(pPr, f'{W}ind')
-            ind.set(f'{W}left', '720')  # ~0.5 inch indent
+        # =====================================================================
+        # REFERENCE MATCHING using StructureMap when available
+        # =====================================================================
+        reference_pPr = None
         
-        # Apply BULLET or NUMBERED format - copy numPr from target or nearby paragraph
-        # Both use same OOXML mechanism (numPr), Word distinguishes by numId
-        if 'BULLET' in formats or 'NUMBERED' in formats:
-            # First try target paragraph
-            numPr_found = None
-            target_pPr = target.find(f'{W}pPr')
-            if target_pPr is not None:
-                numPr_found = target_pPr.find(f'{W}numPr')
+        if 'SECTION_HEAD' in formats or 'HEADING' in formats:
+            # USE STRUCTURE MAP to find actual SECTION_HEAD paragraphs
+            if structure is not None:
+                try:
+                    from ooxml_lib.structure_detector import NodeRole
+                    section_heads = structure.find_nodes_by_role(NodeRole.SECTION_HEAD)
+                    for node in section_heads:
+                        if 0 <= node.paragraph_index < len(paragraphs):
+                            p = paragraphs[node.paragraph_index]
+                            p_pPr = p.find(f'{W}pPr')
+                            if p_pPr is not None:
+                                pStyle = p_pPr.find(f'{W}pStyle')
+                                if pStyle is not None:
+                                    style_val = pStyle.get(f'{W}val', '')
+                                    # Skip "Title" - we want actual section heading style
+                                    if style_val.lower() != 'title':
+                                        reference_pPr = p_pPr
+                                        logger.info(f"insert_with_format: Found SECTION_HEAD '{node.text[:30]}...' with style={style_val}")
+                                        break
+                except ImportError:
+                    pass
             
-            # If target doesn't have numPr, search nearby paragraphs
-            if numPr_found is None:
-                paragraphs = self.body.findall(f'{W}p')
-                for search_idx in range(max(0, after_index - 3), min(len(paragraphs), after_index + 3)):
-                    search_para = paragraphs[search_idx]
-                    search_pPr = search_para.find(f'{W}pPr')
-                    if search_pPr is not None:
-                        numPr_found = search_pPr.find(f'{W}numPr')
-                        if numPr_found is not None:
-                            logger.info(f"insert_with_format: Found numPr at p{search_idx}")
+            # Fallback: look for Heading style in paragraphs
+            if reference_pPr is None:
+                for p in paragraphs:
+                    p_pPr = p.find(f'{W}pPr')
+                    if p_pPr is not None:
+                        pStyle = p_pPr.find(f'{W}pStyle')
+                        if pStyle is not None:
+                            style_val = pStyle.get(f'{W}val', '').lower()
+                            if 'heading' in style_val and 'title' not in style_val:
+                                reference_pPr = p_pPr
+                                logger.info(f"insert_with_format: Found Heading style={style_val}")
+                                break
+        
+        elif 'BOLD' in formats and 'CLAUSE' not in formats and 'NUMBERED' not in formats:
+            # Find a bold paragraph (for standalone bold headings)
+            for p in paragraphs:
+                first_run = p.find(f'.//{W}r')
+                if first_run is not None:
+                    rPr = first_run.find(f'{W}rPr')
+                    if rPr is not None and rPr.find(f'{W}b') is not None:
+                        p_pPr = p.find(f'{W}pPr')
+                        if p_pPr is not None:
+                            reference_pPr = p_pPr
+                            text = ''.join(t.text or '' for t in p.findall(f'.//{W}t'))
+                            logger.info(f"insert_with_format: Found BOLD reference: '{text[:30]}...'")
                             break
+        
+        elif 'CLAUSE' in formats or 'NUMBERED' in formats:
+            # Find a CLAUSE paragraph - looks for numbered paragraphs like "1." "2." etc.
+            for p in paragraphs:
+                text = ''.join(t.text or '' for t in p.findall(f'.//{W}t'))
+                if re.match(r'^\d+\.', text.strip()):
+                    p_pPr = p.find(f'{W}pPr')
+                    if p_pPr is not None:
+                        reference_pPr = p_pPr
+                        logger.info(f"insert_with_format: Found CLAUSE reference: '{text[:30]}...'")
+                        break
+        
+        elif 'LETTERED' in formats:
+            # Find (a), (b), (c) style items
+            for p in paragraphs:
+                text = ''.join(t.text or '' for t in p.findall(f'.//{W}t'))
+                if re.match(r'^\s*\([a-z]\)', text.strip()):
+                    p_pPr = p.find(f'{W}pPr')
+                    if p_pPr is not None:
+                        reference_pPr = p_pPr
+                        logger.info(f"insert_with_format: Found LETTERED reference: '{text[:30]}...'")
+                        break
+        
+        elif 'BULLET' in formats or 'LIST_ITEM' in formats:
+            # Use StructureMap to find LIST_ITEM paragraphs
+            if structure is not None:
+                try:
+                    from ooxml_lib.structure_detector import NodeRole
+                    list_items = structure.find_nodes_by_role(NodeRole.LIST_ITEM)
+                    for node in list_items:
+                        if 0 <= node.paragraph_index < len(paragraphs):
+                            p = paragraphs[node.paragraph_index]
+                            p_pPr = p.find(f'{W}pPr')
+                            if p_pPr is not None:
+                                reference_pPr = p_pPr
+                                logger.info(f"insert_with_format: Found LIST_ITEM reference '{node.text[:30]}...'")
+                                break
+                except ImportError:
+                    pass
             
-            if numPr_found is not None:
-                import copy
-                pPr.append(copy.deepcopy(numPr_found))
-                logger.info(f"insert_with_format: Applied numPr for {format_label}")
-            else:
-                logger.warning(f"insert_with_format: No numPr found for {format_label}, paragraph will be unnumbered")
+            # Fallback: look for paragraphs with numPr (Word auto-bullets)
+            if reference_pPr is None:
+                for p in paragraphs:
+                    p_pPr = p.find(f'{W}pPr')
+                    if p_pPr is not None:
+                        numPr = p_pPr.find(f'{W}numPr')
+                        if numPr is not None:
+                            reference_pPr = p_pPr
+                            logger.info("insert_with_format: Found BULLET reference with numPr")
+                            break
         
-        # Create track change wrapper
+        elif 'INDENTED' in formats or 'BODY' in formats:
+            # Find BODY paragraphs using structure map or by looking for indented non-numbered text
+            if structure is not None:
+                try:
+                    from ooxml_lib.structure_detector import NodeRole
+                    # Look for BODY or LIST_ITEM paragraphs
+                    body_nodes = structure.find_nodes_by_role(NodeRole.BODY)
+                    if not body_nodes:
+                        body_nodes = structure.find_nodes_by_role(NodeRole.LIST_ITEM)
+                    for node in body_nodes:
+                        if 0 <= node.paragraph_index < len(paragraphs):
+                            p = paragraphs[node.paragraph_index]
+                            p_pPr = p.find(f'{W}pPr')
+                            if p_pPr is not None:
+                                ind = p_pPr.find(f'{W}ind')
+                                if ind is not None:
+                                    reference_pPr = p_pPr
+                                    logger.info(f"insert_with_format: Found BODY reference '{node.text[:30]}...'")
+                                    break
+                except ImportError:
+                    pass
+            
+            # Fallback: look for indented paragraphs with indent > 720
+            if reference_pPr is None:
+                for p in paragraphs:
+                    p_pPr = p.find(f'{W}pPr')
+                    if p_pPr is not None:
+                        ind = p_pPr.find(f'{W}ind')
+                        if ind is not None:
+                            left_val = ind.get(f'{W}left', '0')
+                            try:
+                                if int(left_val) >= 1080:
+                                    reference_pPr = p_pPr
+                                    text = ''.join(t.text or '' for t in p.findall(f'.//{W}t'))
+                                    logger.info(f"insert_with_format: Found INDENTED reference with left={left_val}: '{text[:30]}...'")
+                                    break
+                            except ValueError:
+                                pass
+        
+        # Clone formatting from reference
+        if reference_pPr is not None:
+            # Clone pStyle (Word paragraph style like "Heading 1") - CRITICAL!
+            pStyle = reference_pPr.find(f'{W}pStyle')
+            if pStyle is not None:
+                pPr.append(copy.deepcopy(pStyle))
+                logger.info(f"insert_with_format: Cloned pStyle={pStyle.get(f'{W}val')}")
+            
+            # Clone numPr if present
+            numPr = reference_pPr.find(f'{W}numPr')
+            if numPr is not None:
+                pPr.append(copy.deepcopy(numPr))
+                logger.info("insert_with_format: Cloned numPr")
+            
+            # Clone ind (indentation)
+            ind = reference_pPr.find(f'{W}ind')
+            if ind is not None:
+                pPr.append(copy.deepcopy(ind))
+                logger.info("insert_with_format: Cloned ind (indent)")
+            
+            # Clone spacing
+            spacing = reference_pPr.find(f'{W}spacing')
+            if spacing is not None:
+                pPr.append(copy.deepcopy(spacing))
+                logger.info("insert_with_format: Cloned spacing")
+        else:
+            # NO REFERENCE FOUND - Apply defaults based on format type
+            logger.info(f"insert_with_format: No reference found, applying defaults for {format_label}")
+            
+            if 'CLAUSE' in formats or 'NUMBERED' in formats:
+                # Default for clauses: indent = 720 twips (~0.5 inch)
+                ind = etree.SubElement(pPr, f'{W}ind')
+                ind.set(f'{W}left', '720')
+                ind.set(f'{W}hanging', '720')
+                logger.info("insert_with_format: Applied default CLAUSE indent (720)")
+            elif 'LETTERED' in formats:
+                # Default for lettered: indent = 1080 twips
+                ind = etree.SubElement(pPr, f'{W}ind')
+                ind.set(f'{W}left', '1080')
+                ind.set(f'{W}hanging', '360')
+                logger.info("insert_with_format: Applied default LETTERED indent (1080)")
+            elif 'INDENTED' in formats or 'BODY' in formats:
+                # Default for body text: indent = 1080 twips
+                ind = etree.SubElement(pPr, f'{W}ind')
+                ind.set(f'{W}left', '1080')
+                logger.info("insert_with_format: Applied default BODY indent (1080)")
+        
+        # =====================================================================
+        # Add content with appropriate bold pattern
+        # =====================================================================
         ins = etree.SubElement(new_para, f'{W}ins', self._create_tc_attrs())
-        run = etree.SubElement(ins, f'{W}r')
         
-        # Apply BOLD format to run
-        if 'BOLD' in formats:
-            rPr = etree.SubElement(run, f'{W}rPr')
+        # For CLAUSE/NUMBERED: Bold the clause number
+        # Check for sub-clause pattern first (e.g., "4.5 ", "8.2 "), then major clause (e.g., "1. ")
+        sub_clause_match = re.match(r'^(\d+\.\d+)\s+', content)  # e.g., "4.5 Acceptance..."
+        major_clause_match = re.match(r'^(\d+\.)\s+', content)    # e.g., "1. SALE AND PURCHASE"
+        
+        if ('CLAUSE' in formats or 'NUMBERED' in formats) and (sub_clause_match or major_clause_match):
+            # Use sub-clause match if available, otherwise major clause
+            match = sub_clause_match if sub_clause_match else major_clause_match
+            number = match.group(1)
+            rest = content[len(match.group(0)):].strip()
+            
+            # Bold run for number
+            bold_run = etree.SubElement(ins, f'{W}r')
+            rPr = etree.SubElement(bold_run, f'{W}rPr')
             etree.SubElement(rPr, f'{W}b')
-        
-        # Add text
-        t = etree.SubElement(run, f'{W}t')
-        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-        t.text = content
+            t = etree.SubElement(bold_run, f'{W}t')
+            t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            t.text = number + ' '  # Number with single space
+            
+            # Normal run for rest
+            if rest:
+                normal_run = etree.SubElement(ins, f'{W}r')
+                t2 = etree.SubElement(normal_run, f'{W}t')
+                t2.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                t2.text = rest
+            
+            logger.info(f"insert_with_format: Applied bold to clause number '{number}'")
+        else:
+            # Regular content
+            run = etree.SubElement(ins, f'{W}r')
+            
+            # Apply BOLD if requested
+            if 'BOLD' in formats:
+                rPr = etree.SubElement(run, f'{W}rPr')
+                etree.SubElement(rPr, f'{W}b')
+            
+            t = etree.SubElement(run, f'{W}t')
+            t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            t.text = content
         
         # Insert after target
         target.addnext(new_para)
@@ -780,68 +975,96 @@ class StyleAwareEditor:
     def insert_with_format_before(self, before_index: int, format_label: str, content: str) -> bool:
         """
         Insert paragraph with specified format BEFORE the target paragraph.
-        
-        Same formatting logic as insert_with_format, but uses addprevious().
+        Same logic as insert_with_format but uses addprevious().
         """
+        import copy
+        import re
+        
         paragraphs = self.body.findall(f'{W}p')
         if before_index < 0 or before_index >= len(paragraphs):
             logger.warning(f"insert_with_format_before: Index {before_index} out of bounds")
             return False
         
         target = paragraphs[before_index]
-        
-        # Parse combined format labels
         formats = format_label.upper().split('+')
         
-        # Create paragraph
         new_para = etree.Element(f'{W}p')
         pPr = etree.SubElement(new_para, f'{W}pPr')
         
-        # Apply INDENTED format
-        if 'INDENTED' in formats:
-            ind = etree.SubElement(pPr, f'{W}ind')
-            ind.set(f'{W}left', '720')
+        # REFERENCE MATCHING by format type
+        reference_pPr = None
         
-        # Apply BULLET or NUMBERED format - copy numPr from target or nearby paragraph
-        if 'BULLET' in formats or 'NUMBERED' in formats:
-            numPr_found = None
-            target_pPr = target.find(f'{W}pPr')
-            if target_pPr is not None:
-                numPr_found = target_pPr.find(f'{W}numPr')
-            
-            # If target doesn't have numPr, search nearby paragraphs
-            if numPr_found is None:
-                for search_idx in range(max(0, before_index - 3), min(len(paragraphs), before_index + 3)):
-                    search_para = paragraphs[search_idx]
-                    search_pPr = search_para.find(f'{W}pPr')
-                    if search_pPr is not None:
-                        numPr_found = search_pPr.find(f'{W}numPr')
-                        if numPr_found is not None:
-                            logger.info(f"insert_with_format_before: Found numPr at p{search_idx}")
-                            break
-            
-            if numPr_found is not None:
-                import copy
-                pPr.append(copy.deepcopy(numPr_found))
-                logger.info(f"insert_with_format_before: Applied numPr for {format_label}")
-            else:
-                logger.warning(f"insert_with_format_before: No numPr found for {format_label}")
+        if 'CLAUSE' in formats or 'NUMBERED' in formats:
+            for p in paragraphs:
+                text = ''.join(t.text or '' for t in p.findall(f'.//{W}t'))
+                if re.match(r'^\d+\.', text.strip()):
+                    p_pPr = p.find(f'{W}pPr')
+                    if p_pPr is not None:
+                        reference_pPr = p_pPr
+                        break
+        elif 'LETTERED' in formats:
+            for p in paragraphs:
+                text = ''.join(t.text or '' for t in p.findall(f'.//{W}t'))
+                if re.match(r'^\s*\([a-z]\)', text.strip()):
+                    p_pPr = p.find(f'{W}pPr')
+                    if p_pPr is not None:
+                        reference_pPr = p_pPr
+                        break
+        elif 'BULLET' in formats:
+            for p in paragraphs:
+                p_pPr = p.find(f'{W}pPr')
+                if p_pPr is not None and p_pPr.find(f'{W}numPr') is not None:
+                    reference_pPr = p_pPr
+                    break
         
-        # Create track change wrapper
+        # Clone or apply defaults
+        if reference_pPr is not None:
+            for elem_name in ['numPr', 'ind', 'spacing']:
+                elem = reference_pPr.find(f'{W}{elem_name}')
+                if elem is not None:
+                    pPr.append(copy.deepcopy(elem))
+        else:
+            if 'CLAUSE' in formats or 'NUMBERED' in formats:
+                ind = etree.SubElement(pPr, f'{W}ind')
+                ind.set(f'{W}left', '720')
+                ind.set(f'{W}hanging', '720')
+            elif 'LETTERED' in formats:
+                ind = etree.SubElement(pPr, f'{W}ind')
+                ind.set(f'{W}left', '1080')
+                ind.set(f'{W}hanging', '360')
+            elif 'INDENTED' in formats:
+                ind = etree.SubElement(pPr, f'{W}ind')
+                ind.set(f'{W}left', '720')
+        
+        # Add content with bold pattern
         ins = etree.SubElement(new_para, f'{W}ins', self._create_tc_attrs())
-        run = etree.SubElement(ins, f'{W}r')
         
-        # Apply BOLD format to run
-        if 'BOLD' in formats:
-            rPr = etree.SubElement(run, f'{W}rPr')
+        if ('CLAUSE' in formats or 'NUMBERED' in formats) and re.match(r'^(\d+\.)\s*', content):
+            match = re.match(r'^(\d+\.)\s*', content)
+            number = match.group(1)
+            rest = content[len(match.group(0)):]
+            
+            bold_run = etree.SubElement(ins, f'{W}r')
+            rPr = etree.SubElement(bold_run, f'{W}rPr')
             etree.SubElement(rPr, f'{W}b')
+            t = etree.SubElement(bold_run, f'{W}t')
+            t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            t.text = number + '      '
+            
+            if rest.strip():
+                normal_run = etree.SubElement(ins, f'{W}r')
+                t2 = etree.SubElement(normal_run, f'{W}t')
+                t2.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                t2.text = rest
+        else:
+            run = etree.SubElement(ins, f'{W}r')
+            if 'BOLD' in formats:
+                rPr = etree.SubElement(run, f'{W}rPr')
+                etree.SubElement(rPr, f'{W}b')
+            t = etree.SubElement(run, f'{W}t')
+            t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            t.text = content
         
-        # Add text
-        t = etree.SubElement(run, f'{W}t')
-        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-        t.text = content
-        
-        # Insert BEFORE target (key difference)
         target.addprevious(new_para)
         logger.info(f"insert_with_format_before: Inserted {format_label} before p{before_index}")
         return True
@@ -1004,82 +1227,170 @@ class StyleAwareEditor:
             op_name = {0: 'EQUAL', -1: 'DELETE', 1: 'INSERT'}.get(op, 'UNKNOWN')
             logger.info(f"  {op_name}: '{text[:40]}...' " if len(text) > 40 else f"  {op_name}: '{text}'")
         
-        # Build character positions mapping
-        positions = []
-        for run in para.findall(f'{W}r'):
-            for t in run.findall(f'{W}t'):
-                if t.text:
-                    for i, char in enumerate(t.text):
-                        positions.append((run, t, i))
-        
-        if start_pos >= len(positions):
-            return False
-        
-        # Get target run and its properties
-        start_run, start_t, start_i = positions[start_pos]
-        rPr = start_run.find(f'{W}rPr')
+        # =====================================================================
+        # BUILD WORD MAP BEFORE CLEARING RUNS
+        # This preserves the original formatting for each word
+        # =====================================================================
+        word_map = build_word_map_for_paragraph(para)
+        logger.info(f"amend_text: Built word map with {len(word_map)} words")
         
         # Build new paragraph content with track changes
         # Strategy: Replace the text element content with surgical changes
         before_text = full_text[:start_pos]
         after_text = full_text[end_pos:]
         
-        # Clear the paragraph's runs and rebuild
-        for run in list(para.findall(f'{W}r')):
-            para.remove(run)
+        logger.info(f"amend_text: start_pos={start_pos}, end_pos={end_pos}")
+        logger.info(f"amend_text: before_text='{before_text[:50]}...' len={len(before_text)}")
+        logger.info(f"amend_text: after_text='{after_text[:50]}...' len={len(after_text)}")
         
-        # Rebuild: before text (plain) + diffs (track changes) + after text (plain)
+        # =====================================================================
+        # SURGICAL REPLACEMENT: Replace only runs containing the target text
+        # This preserves existing track changes from previous AMENDs
+        # =====================================================================
         
-        # 1. Before text as plain run
-        if before_text:
-            before_run = etree.SubElement(para, f'{W}r')
-            if rPr is not None:
-                before_run.insert(0, deepcopy(rPr))
-            before_t = etree.SubElement(before_run, f'{W}t')
-            before_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-            before_t.text = before_text
+        # Find which runs contain the text range [start_pos, end_pos]
+        current_pos = 0
+        runs_to_replace = []
+        run_positions = []  # (run_element, run_start, run_end)
         
-        # 2. Apply diffs with track changes
-        for op, text in diffs:
-            if not text:
+        # Collect all text-bearing elements and their positions
+        for child in list(para):
+            if child.tag == f'{W}pPr':
                 continue
-                
-            if op == 0:  # EQUAL - unchanged text
-                equal_run = etree.SubElement(para, f'{W}r')
-                if rPr is not None:
-                    equal_run.insert(0, deepcopy(rPr))
-                equal_t = etree.SubElement(equal_run, f'{W}t')
-                equal_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                equal_t.text = text
-                
-            elif op == -1:  # DELETE
-                del_elem = etree.SubElement(para, f'{W}del', self._create_tc_attrs())
-                del_run = etree.SubElement(del_elem, f'{W}r')
-                if rPr is not None:
-                    del_run.insert(0, deepcopy(rPr))
-                del_text = etree.SubElement(del_run, f'{W}delText')
-                del_text.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                del_text.text = text
-                
-            elif op == 1:  # INSERT
-                ins_elem = etree.SubElement(para, f'{W}ins', self._create_tc_attrs())
-                ins_run = etree.SubElement(ins_elem, f'{W}r')
-                if rPr is not None:
-                    ins_run.insert(0, deepcopy(rPr))
-                ins_text = etree.SubElement(ins_run, f'{W}t')
-                ins_text.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                ins_text.text = text
+            
+            # Get text from this element (handles w:r, w:ins, w:del, etc.)
+            if child.tag == f'{W}r':
+                t_elem = child.find(f'{W}t')
+                if t_elem is not None and t_elem.text:
+                    run_len = len(t_elem.text)
+                    run_positions.append((child, current_pos, current_pos + run_len))
+                    current_pos += run_len
+            elif child.tag in (f'{W}ins', f'{W}del'):
+                # Track changes - get text from nested runs
+                for r in child.findall(f'.//{W}r'):
+                    t_elem = r.find(f'{W}t')
+                    delText = r.find(f'{W}delText')
+                    if t_elem is not None and t_elem.text:
+                        run_len = len(t_elem.text)
+                        run_positions.append((child, current_pos, current_pos + run_len))
+                        current_pos += run_len
+                    elif delText is not None and delText.text:
+                        # Deleted text doesn't count in current position
+                        pass
         
-        # 3. After text as plain run
-        if after_text:
-            after_run = etree.SubElement(para, f'{W}r')
-            if rPr is not None:
-                after_run.insert(0, deepcopy(rPr))
-            after_t = etree.SubElement(after_run, f'{W}t')
-            after_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-            after_t.text = after_text
+        # Find runs that overlap with [start_pos, end_pos]
+        first_run_idx = None
+        last_run_idx = None
+        for i, (elem, rstart, rend) in enumerate(run_positions):
+            if rstart < end_pos and rend > start_pos:
+                if first_run_idx is None:
+                    first_run_idx = i
+                last_run_idx = i
         
-        logger.info(f"amend_text: Applied surgical changes successfully")
+        if first_run_idx is None:
+            logger.warning(f"amend_text: Could not find runs for text at {start_pos}-{end_pos}")
+            # Fall back to clear-and-rebuild strategy
+            elements_to_remove = []
+            for child in list(para):
+                if child.tag != f'{W}pPr':
+                    elements_to_remove.append(child)
+            for elem in elements_to_remove:
+                para.remove(elem)
+            logger.info(f"amend_text: Fallback - Cleared {len(elements_to_remove)} elements")
+        else:
+            # Remove only the runs we're replacing
+            first_elem = run_positions[first_run_idx][0]
+            insert_point = first_elem  # We'll insert before this, then remove it
+            
+            # Collect elements to remove (they may be the same if one run spans the text)
+            elems_to_remove = set()
+            for i in range(first_run_idx, last_run_idx + 1):
+                elems_to_remove.add(run_positions[i][0])
+            
+            logger.info(f"amend_text: Replacing {len(elems_to_remove)} run(s) in range [{first_run_idx}, {last_run_idx}]")
+            
+            # Build new content with track changes
+            new_elements = []
+            
+            # Before text from first overlapping run
+            first_run_start = run_positions[first_run_idx][1]
+            if start_pos > first_run_start:
+                before_in_run = full_text[first_run_start:start_pos]
+                if before_in_run:
+                    segment_rPr = get_formatting_for_char_position(word_map, first_run_start)
+                    before_run = etree.Element(f'{W}r')
+                    if segment_rPr is not None:
+                        before_run.insert(0, deepcopy(segment_rPr))
+                    before_t = etree.SubElement(before_run, f'{W}t')
+                    before_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                    before_t.text = before_in_run
+                    new_elements.append(before_run)
+            
+            # Diff content (DELETE + INSERT)
+            current_char_pos = start_pos
+            for op, text in diffs:
+                if not text:
+                    continue
+                segment_rPr = get_formatting_for_char_position(word_map, current_char_pos)
+                
+                if op == 0:  # EQUAL
+                    equal_run = etree.Element(f'{W}r')
+                    if segment_rPr is not None:
+                        equal_run.insert(0, deepcopy(segment_rPr))
+                    equal_t = etree.SubElement(equal_run, f'{W}t')
+                    equal_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                    equal_t.text = text
+                    new_elements.append(equal_run)
+                    current_char_pos += len(text)
+                    
+                elif op == -1:  # DELETE
+                    del_elem = etree.Element(f'{W}del', self._create_tc_attrs())
+                    del_run = etree.SubElement(del_elem, f'{W}r')
+                    if segment_rPr is not None:
+                        del_run.insert(0, deepcopy(segment_rPr))
+                    del_text = etree.SubElement(del_run, f'{W}delText')
+                    del_text.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                    del_text.text = text
+                    new_elements.append(del_elem)
+                    current_char_pos += len(text)
+                    
+                elif op == 1:  # INSERT
+                    ins_elem = etree.Element(f'{W}ins', self._create_tc_attrs())
+                    ins_run = etree.SubElement(ins_elem, f'{W}r')
+                    if segment_rPr is not None:
+                        ins_run.insert(0, deepcopy(segment_rPr))
+                    ins_text = etree.SubElement(ins_run, f'{W}t')
+                    ins_text.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                    ins_text.text = text
+                    new_elements.append(ins_elem)
+            
+            # After text from last overlapping run
+            last_run_end = run_positions[last_run_idx][2]
+            if end_pos < last_run_end:
+                after_in_run = full_text[end_pos:last_run_end]
+                if after_in_run:
+                    segment_rPr = get_formatting_for_char_position(word_map, end_pos)
+                    after_run = etree.Element(f'{W}r')
+                    if segment_rPr is not None:
+                        after_run.insert(0, deepcopy(segment_rPr))
+                    after_t = etree.SubElement(after_run, f'{W}t')
+                    after_t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                    after_t.text = after_in_run
+                    new_elements.append(after_run)
+            
+            # Insert new elements before first_elem, then remove old elements
+            parent_idx = list(para).index(first_elem)
+            for i, elem in enumerate(new_elements):
+                para.insert(parent_idx + i, elem)
+            
+            # Remove old elements
+            for elem in elems_to_remove:
+                if elem in para:
+                    para.remove(elem)
+            
+            logger.info(f"amend_text: Replaced with {len(new_elements)} new element(s)")
+        
+        logger.info(f"amend_text: Applied surgical changes with formatting preservation")
         return True
     
     def delete_paragraph(self, containing_text: str) -> bool:
