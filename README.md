@@ -239,14 +239,6 @@ Built using:
 
 ---
 
-## Contributing
-
-This project is open source under the **GPL-3.0 licence**.
-
-If you modify and distribute this software, you must open-source your changes.
-
----
-
 ## Get In Touch
 
 Questions? Ideas? Found a bug?
